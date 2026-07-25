@@ -302,7 +302,7 @@ app.post('/api/lex-handoffs', upload.fields([
     const lexResponse = await fetch(`${LEX_API_BASE_URL}/api/engagements`, {
       method: 'POST',
       body: lexPayload,
-      headers: lexAuthHeaders()
+      headers: lexAuthHeaders(req)
     });
     const contentType = lexResponse.headers.get('content-type') || '';
     const payload = contentType.includes('application/json')
@@ -325,7 +325,7 @@ app.post('/api/lex-handoffs', upload.fields([
 app.get('/api/lex-jobs/:jobId', async (req, res, next) => {
   try {
     const lexResponse = await fetch(`${LEX_API_BASE_URL}/api/review-jobs/${encodeURIComponent(req.params.jobId)}`, {
-      headers: lexAuthHeaders()
+      headers: lexAuthHeaders(req)
     });
     const contentType = lexResponse.headers.get('content-type') || '';
     const payload = contentType.includes('application/json')
@@ -1219,8 +1219,15 @@ function normalizeBaseUrl(value) {
   return String(value || '').replace(/\/+$/g, '');
 }
 
-function lexAuthHeaders() {
-  return LEX_API_TOKEN ? { Authorization: `Bearer ${LEX_API_TOKEN}` } : {};
+function lexAuthHeaders(req) {
+  const headers = LEX_API_TOKEN ? { Authorization: `Bearer ${LEX_API_TOKEN}` } : {};
+  const portalUser = req.get('x-dbsi-portal-user');
+
+  if (portalUser) {
+    headers['x-dbsi-portal-user'] = portalUser;
+  }
+
+  return headers;
 }
 
 function randomId() {
