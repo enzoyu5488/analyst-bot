@@ -44,6 +44,7 @@ Optional settings:
 PORT=3000
 OPENAI_MODEL=gpt-5-mini
 OPENAI_TIMEOUT_MS=240000
+ANALYSIS_JOB_TTL_MS=1800000
 MAX_CONTEXT_CHARS=60000
 QUESTION_FILE_CONTEXT_CHARS=40000
 MAX_UPLOAD_MB=20
@@ -57,6 +58,7 @@ MICROSOFT_CLIENT_SECRET=
 MICROSOFT_REDIRECT_URI=http://localhost:3101/auth/callback
 MICROSOFT_ALLOWED_EMAIL_DOMAIN=
 SESSION_SECRET=replace-with-a-long-random-string
+SESSION_COOKIE_SECURE=false
 MONGODB_URI=
 MONGODB_DB_NAME=analyst_bot
 MONGODB_STORIES_COLLECTION=customer_user_stories
@@ -83,6 +85,8 @@ Supported uploads: PDF, DOCX, TXT, HTML, Markdown, CSV, and JSON.
 
 When a file is uploaded, Ari treats it as primary source material. Ari reads the document before asking clarifying questions and should only ask about items that are missing, unclear, or materially change the analysis.
 
+Long-running document reading, clarifying questions, and analysis run as background jobs. The browser starts the job and polls Ari until the result is ready, so large document analysis is less likely to fail because of a gateway request timeout.
+
 ## Customer User Stories
 
 Ari drafts business-readable user stories as part of every analysis. When `MONGODB_URI` is configured, each analysis saves those stories against the customer name provided at intake.
@@ -93,13 +97,13 @@ Saved story sets are written to `MONGODB_STORIES_COLLECTION` and can be retrieve
 GET /api/customers/:customerName/user-stories
 ```
 
-Microsoft SSO follows the same environment pattern as contract-bot. Leave `MICROSOFT_CLIENT_ID` and `MICROSOFT_CLIENT_SECRET` blank for local unauthenticated development, or set them to require Microsoft sign-in.
+Microsoft SSO follows the same environment pattern as contract-bot. Leave `MICROSOFT_CLIENT_ID` and `MICROSOFT_CLIENT_SECRET` blank for local unauthenticated development, or set them to require Microsoft sign-in. If Ari is served over plain HTTP through the port 80 NAT redirect, keep `SESSION_COOKIE_SECURE=false`; if Ari is behind HTTPS, set it to `true`.
 
 Saved analysis records include `orgSlug`; the default is `devboxph` so the same MongoDB database can support future tenants cleanly.
 
 ## Instance Setup
 
-Use `setup-analyst-bot-instance.sh` to provision an Ubuntu instance with Node.js 20, PM2, dependencies, and Ari running on port `3101`.
+Use `setup-analyst-bot-instance.sh` to provision an Ubuntu instance with Node.js 20, PM2, dependencies, Ari running on port `3101`, and iptables NAT redirecting public port `80` to `3101`.
 
 ```bash
 chmod +x setup-analyst-bot-instance.sh

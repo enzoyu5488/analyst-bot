@@ -33,6 +33,7 @@ const MICROSOFT_REDIRECT_URI = process.env.MICROSOFT_REDIRECT_URI || `http://loc
 const MICROSOFT_ALLOWED_EMAIL_DOMAIN = String(process.env.MICROSOFT_ALLOWED_EMAIL_DOMAIN || '').toLowerCase();
 const AUTH_ENABLED = Boolean(MICROSOFT_CLIENT_ID && MICROSOFT_CLIENT_SECRET);
 const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
+const SESSION_COOKIE_SECURE = parseBooleanEnv('SESSION_COOKIE_SECURE', process.env.NODE_ENV === 'production');
 const MONGODB_URI = process.env.MONGODB_URI || '';
 const MONGODB_DB_NAME = process.env.MONGODB_DB_NAME || 'analyst_bot';
 const MONGODB_STORIES_COLLECTION = process.env.MONGODB_STORIES_COLLECTION || process.env.MONGODB_COLLECTION || 'customer_user_stories';
@@ -42,6 +43,9 @@ let openai;
 let msalClient;
 let mongoClient;
 let storiesIndexesReady = false;
+const analysisJobs = new Map();
+const clarificationJobs = new Map();
+const ANALYSIS_JOB_TTL_MS = Number(process.env.ANALYSIS_JOB_TTL_MS || 30 * 60 * 1000);
 
 const upload = multer({
   dest: UPLOAD_DIR,
@@ -76,7 +80,7 @@ app.use(session({
   cookie: {
     httpOnly: true,
     sameSite: 'lax',
-    secure: process.env.NODE_ENV === 'production',
+    secure: SESSION_COOKIE_SECURE,
     maxAge: 8 * 60 * 60 * 1000
   }
 }));
@@ -94,6 +98,7 @@ app.get('/auth/signin', async (req, res, next) => {
     }
     const state = randomId();
     req.session.authState = state;
+    await saveSession(req);
     const authUrl = await getMsalClient().getAuthCodeUrl({
       scopes: ['openid', 'profile', 'email', 'User.Read'],
       redirectUri: microsoftRedirectUri(req),
@@ -132,6 +137,7 @@ app.get('/auth/callback', async (req, res, next) => {
     };
     const returnTo = safeReturnTo(req.session.returnTo);
     req.session.returnTo = null;
+    await saveSession(req);
     res.redirect(returnTo || '/');
   } catch (error) { next(error); }
 });
@@ -177,6 +183,29 @@ app.post('/api/analyses', upload.array('supportingFiles', 8), async (req, res, n
   } finally {
     await cleanupFiles(req.files || []);
   }
+});
+
+app.post('/api/analysis-jobs', upload.array('supportingFiles', 8), async (req, res, next) => {
+  try {
+    const payload = normalizeRequest(req.body);
+    ensureSupportingFileForDocumentLedPath(payload, req.files || []);
+    const files = await extractUploadedFiles(req.files || []);
+    const job = createAnalysisJob(payload, files, req.session.user);
+    res.status(202).json({ success: true, job: clientAnalysisJob(job) });
+  } catch (error) {
+    next(error);
+  } finally {
+    await cleanupFiles(req.files || []);
+  }
+});
+
+app.get('/api/analysis-jobs/:jobId', (req, res, next) => {
+  try {
+    pruneAnalysisJobs();
+    const job = analysisJobs.get(req.params.jobId);
+    if (!job) throw Object.assign(new Error('Ari analysis job was not found. Please start the analysis again.'), { status: 404 });
+    res.json({ success: true, job: clientAnalysisJob(job) });
+  } catch (error) { next(error); }
 });
 
 app.get('/api/customers/:customerName/user-stories', async (req, res, next) => {
@@ -236,6 +265,29 @@ app.post('/api/clarifying-questions', upload.array('supportingFiles', 8), async 
   } finally {
     await cleanupFiles(req.files || []);
   }
+});
+
+app.post('/api/clarifying-question-jobs', upload.array('supportingFiles', 8), async (req, res, next) => {
+  try {
+    const payload = normalizeRequest(req.body);
+    ensureSupportingFileForDocumentLedPath(payload, req.files || []);
+    const files = await extractUploadedFiles(req.files || []);
+    const job = createClarificationJob(payload, files);
+    res.status(202).json({ success: true, job: clientClarificationJob(job) });
+  } catch (error) {
+    next(error);
+  } finally {
+    await cleanupFiles(req.files || []);
+  }
+});
+
+app.get('/api/clarifying-question-jobs/:jobId', (req, res, next) => {
+  try {
+    pruneClarificationJobs();
+    const job = clarificationJobs.get(req.params.jobId);
+    if (!job) throw Object.assign(new Error('Ari question job was not found. Please start again.'), { status: 404 });
+    res.json({ success: true, job: clientClarificationJob(job) });
+  } catch (error) { next(error); }
 });
 
 app.post('/api/lex-handoffs', upload.fields([
@@ -776,6 +828,64 @@ async function createTechnicalAnalysis(request, files) {
   return JSON.parse(response.output_text);
 }
 
+function createAnalysisJob(request, files, user) {
+  pruneAnalysisJobs();
+  const job = {
+    id: randomId(),
+    status: 'RUNNING',
+    message: 'Ari is reading the document and preparing the analysis.',
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    analysis: null,
+    savedStorySet: null
+  };
+  analysisJobs.set(job.id, job);
+  runAnalysisJob(job, request, files, user);
+  return job;
+}
+
+async function runAnalysisJob(job, request, files, user) {
+  try {
+    const analysis = await createTechnicalAnalysis(request, files);
+    const savedStorySet = await saveCustomerUserStories(request, analysis, user);
+    Object.assign(job, {
+      status: 'COMPLETE',
+      message: 'Analysis ready.',
+      analysis,
+      savedStorySet,
+      updatedAt: new Date().toISOString()
+    });
+  } catch (error) {
+    const normalized = normalizeServerError(error);
+    Object.assign(job, {
+      status: 'FAILED',
+      message: normalized.message,
+      updatedAt: new Date().toISOString()
+    });
+  }
+}
+
+function clientAnalysisJob(job) {
+  return {
+    id: job.id,
+    status: job.status,
+    message: job.message,
+    createdAt: job.createdAt,
+    updatedAt: job.updatedAt,
+    analysis: job.status === 'COMPLETE' ? job.analysis : null,
+    savedStorySet: job.status === 'COMPLETE' ? job.savedStorySet : null
+  };
+}
+
+function pruneAnalysisJobs() {
+  const cutoff = Date.now() - ANALYSIS_JOB_TTL_MS;
+  for (const [id, job] of analysisJobs.entries()) {
+    if (new Date(job.updatedAt || job.createdAt).getTime() < cutoff) {
+      analysisJobs.delete(id);
+    }
+  }
+}
+
 async function createClarifyingQuestions(request, files) {
   if (!hasUsableOpenAIKey()) {
     throw Object.assign(new Error('OPENAI_API_KEY is not configured. Add it to .env before asking Ari for clarifying questions.'), { status: 500 });
@@ -809,6 +919,60 @@ async function createClarifyingQuestions(request, files) {
 
   const parsed = JSON.parse(response.output_text);
   return (parsed.questions || []).slice(0, 3);
+}
+
+function createClarificationJob(request, files) {
+  pruneClarificationJobs();
+  const job = {
+    id: randomId(),
+    status: 'RUNNING',
+    message: 'Ari is reading the document before deciding what to ask.',
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    questions: []
+  };
+  clarificationJobs.set(job.id, job);
+  runClarificationJob(job, request, files);
+  return job;
+}
+
+async function runClarificationJob(job, request, files) {
+  try {
+    const questions = await createClarifyingQuestions(request, files);
+    Object.assign(job, {
+      status: 'COMPLETE',
+      message: questions.length ? 'Ari has a few questions.' : 'Ari has enough detail.',
+      questions,
+      updatedAt: new Date().toISOString()
+    });
+  } catch (error) {
+    const normalized = normalizeServerError(error);
+    Object.assign(job, {
+      status: 'FAILED',
+      message: normalized.message,
+      updatedAt: new Date().toISOString()
+    });
+  }
+}
+
+function clientClarificationJob(job) {
+  return {
+    id: job.id,
+    status: job.status,
+    message: job.message,
+    createdAt: job.createdAt,
+    updatedAt: job.updatedAt,
+    questions: job.status === 'COMPLETE' ? job.questions : []
+  };
+}
+
+function pruneClarificationJobs() {
+  const cutoff = Date.now() - ANALYSIS_JOB_TTL_MS;
+  for (const [id, job] of clarificationJobs.entries()) {
+    if (new Date(job.updatedAt || job.createdAt).getTime() < cutoff) {
+      clarificationJobs.delete(id);
+    }
+  }
 }
 
 function buildClarifyingQuestionPrompt(request, files) {
@@ -1129,10 +1293,26 @@ function parsePortalUser(value) {
   }
 }
 
+function saveSession(req) {
+  if (!req.session?.save) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    req.session.save(error => {
+      if (error) reject(error);
+      else resolve();
+    });
+  });
+}
+
 function safeReturnTo(value) {
   const target = String(value || '').trim();
   if (!target || !target.startsWith('/') || target.startsWith('//')) return '/';
   return target;
+}
+
+function parseBooleanEnv(name, fallback) {
+  const value = process.env[name];
+  if (value === undefined || value === '') return fallback;
+  return ['1', 'true', 'yes', 'on'].includes(String(value).trim().toLowerCase());
 }
 
 function storageStatus() {

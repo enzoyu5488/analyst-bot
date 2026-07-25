@@ -94,14 +94,17 @@ async function askClarifyingQuestions() {
   lexForm.classList.add('hidden');
 
   try {
-    const response = await fetch('/api/clarifying-questions', {
+    const response = await fetch('/api/clarifying-question-jobs', {
       method: 'POST',
       body: new FormData(form),
       headers: { Accept: 'application/json' }
     });
     const payload = await parseApiResponse(response);
     if (!response.ok) throw new Error(payload.message);
-    clarificationQuestions = payload.questions || [];
+    const jobId = payload.job?.id;
+    if (!jobId) throw new Error('Ari did not return a question job id.');
+    const completedJob = await pollClarificationJob(jobId);
+    clarificationQuestions = completedJob.questions || [];
     clarificationStepReady = true;
     renderClarifyingQuestions(clarificationQuestions);
     if (!clarificationQuestions.length) {
@@ -121,6 +124,22 @@ async function askClarifyingQuestions() {
   }
 }
 
+async function pollClarificationJob(jobId) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < 600000) {
+    const payload = await json(`/api/clarifying-question-jobs/${encodeURIComponent(jobId)}`, { method: 'GET' });
+    const job = payload.job;
+    if (!job) throw new Error('Ari question job status was not returned.');
+    if (job.status === 'FAILED') throw new Error(job.message || 'Ari could not prepare clarifying questions.');
+    if (job.status === 'COMPLETE') return job;
+    const elapsedSeconds = Math.round((Date.now() - startedAt) / 1000);
+    status(`Ari is reading the document before asking questions... ${elapsedSeconds}s`);
+    output.textContent = job.message || 'Ari is still reading the document.';
+    await wait(2500);
+  }
+  throw new Error('Ari is still reading the document. Please try again or use the full browser view for this upload.');
+}
+
 async function generateAnalysis() {
   submitBtn.disabled = true;
   skipQuestionsBtn.disabled = true;
@@ -134,18 +153,21 @@ async function generateAnalysis() {
   try {
     const body = new FormData(form);
     body.set('clarificationAnswers', JSON.stringify(readClarificationAnswers()));
-    const response = await fetch('/api/analyses', {
+    const response = await fetch('/api/analysis-jobs', {
       method: 'POST',
       body,
       headers: { Accept: 'application/json' }
     });
     const payload = await parseApiResponse(response);
     if (!response.ok) throw new Error(payload.message);
-    lastAnalysis = payload.analysis;
-    lastSavedStorySet = payload.savedStorySet || null;
+    const jobId = payload.job?.id;
+    if (!jobId) throw new Error('Ari did not return an analysis job id.');
+    const completedJob = await pollAnalysisJob(jobId);
+    lastAnalysis = completedJob.analysis;
+    lastSavedStorySet = completedJob.savedStorySet || null;
     lastIntake = readIntake();
     lastIntake.clarificationAnswers = readClarificationAnswers();
-    renderAnalysis(payload.analysis, lastSavedStorySet);
+    renderAnalysis(completedJob.analysis, lastSavedStorySet);
     prepareLexForm();
     status('Analysis ready.', false, true);
   } catch (error) {
@@ -156,6 +178,25 @@ async function generateAnalysis() {
     submitBtn.disabled = false;
     skipQuestionsBtn.disabled = false;
   }
+}
+
+async function pollAnalysisJob(jobId) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < 900000) {
+    const payload = await json(`/api/analysis-jobs/${encodeURIComponent(jobId)}`, { method: 'GET' });
+    const job = payload.job;
+    if (!job) throw new Error('Ari analysis job status was not returned.');
+    if (job.status === 'FAILED') throw new Error(job.message || 'Ari analysis failed.');
+    if (job.status === 'COMPLETE') {
+      if (!job.analysis) throw new Error('Ari completed without returning an analysis.');
+      return job;
+    }
+    const elapsedSeconds = Math.round((Date.now() - startedAt) / 1000);
+    status(`Ari is reading and analyzing the document... ${elapsedSeconds}s`);
+    output.textContent = job.message || 'Ari is still working on the analysis.';
+    await wait(3000);
+  }
+  throw new Error('Ari is still analyzing the document. Please check the server job status or try a smaller file.');
 }
 
 showLexBtn.addEventListener('click', () => {
