@@ -10,16 +10,15 @@ set -Eeuo pipefail
 #   Application:  /home/ubuntu/analyst-bot
 #   Node.js:      20
 #   App port:     3101
+#   Public port:  80, redirected to 3101 using iptables NAT
 #   PM2 process:  analyst-bot
-#
-# No NAT/iptables redirect is configured. The app listens directly on APP_PORT.
 #
 # Usage:
 #   chmod +x setup-analyst-bot-instance.sh
 #   ./setup-analyst-bot-instance.sh
 #
 # Optional overrides:
-#   REPO_URL=https://github.com/you/analyst-bot.git BRANCH=main APP_PORT=3101 \
+#   REPO_URL=https://github.com/you/analyst-bot.git BRANCH=main APP_PORT=3101 PUBLIC_PORT=80 \
 #     ./setup-analyst-bot-instance.sh
 ###############################################################################
 
@@ -28,6 +27,7 @@ BRANCH="${BRANCH:-main}"
 APP_NAME="${APP_NAME:-analyst-bot}"
 APP_DIR="${APP_DIR:-$HOME/analyst-bot}"
 APP_PORT="${APP_PORT:-3101}"
+PUBLIC_PORT="${PUBLIC_PORT:-80}"
 NODE_VERSION="${NODE_VERSION:-20}"
 NVM_VERSION="${NVM_VERSION:-v0.40.4}"
 
@@ -71,11 +71,17 @@ fi
 log "Installing Ubuntu packages"
 
 sudo -n apt-get update
+
+echo "iptables-persistent iptables-persistent/autosave_v4 boolean true" | sudo -n debconf-set-selections
+echo "iptables-persistent iptables-persistent/autosave_v6 boolean true" | sudo -n debconf-set-selections
+
 sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y \
     build-essential \
     ca-certificates \
     curl \
     git \
+    iptables-persistent \
+    netfilter-persistent \
     wget
 
 if ! command -v gh >/dev/null 2>&1; then
@@ -242,6 +248,40 @@ fi
 
 pm2 save
 
+log "Configuring NAT redirect from port ${PUBLIC_PORT} to ${APP_PORT}"
+
+sudo -n sysctl -w net.ipv4.ip_forward=1 >/dev/null
+
+if [[ ! -f /etc/sysctl.d/99-ari-analyst-bot.conf ]]; then
+    echo "net.ipv4.ip_forward=1" | sudo -n tee /etc/sysctl.d/99-ari-analyst-bot.conf >/dev/null
+fi
+
+EXISTING_CONFLICTING_PUBLIC_REDIRECTS="$(sudo -n iptables-save -t nat \
+    | grep -- "--dport ${PUBLIC_PORT} " \
+    | grep -v -- "--to-ports ${APP_PORT}" || true)"
+if [[ -n "$EXISTING_CONFLICTING_PUBLIC_REDIRECTS" ]]; then
+    echo "$EXISTING_CONFLICTING_PUBLIC_REDIRECTS"
+    fail "Port ${PUBLIC_PORT} already has a NAT redirect to another service. Remove or change that rule before redirecting ${PUBLIC_PORT} to ${APP_PORT}."
+fi
+
+if ! sudo -n iptables -t nat -C PREROUTING \
+    -p tcp --dport "$PUBLIC_PORT" \
+    -j REDIRECT --to-ports "$APP_PORT" >/dev/null 2>&1; then
+    sudo -n iptables -t nat -A PREROUTING \
+        -p tcp --dport "$PUBLIC_PORT" \
+        -j REDIRECT --to-ports "$APP_PORT"
+fi
+
+if ! sudo -n iptables -t nat -C OUTPUT \
+    -p tcp -o lo --dport "$PUBLIC_PORT" \
+    -j REDIRECT --to-ports "$APP_PORT" >/dev/null 2>&1; then
+    sudo -n iptables -t nat -A OUTPUT \
+        -p tcp -o lo --dport "$PUBLIC_PORT" \
+        -j REDIRECT --to-ports "$APP_PORT"
+fi
+
+sudo -n netfilter-persistent save
+
 log "Enabling PM2 startup after reboot"
 
 NODE_BIN_DIR="$(dirname "$(command -v node)")"
@@ -285,6 +325,26 @@ if [[ "$CURL_STATUS" -ne 0 ]]; then
     echo "Review the PM2 logs and confirm the application uses PORT=${APP_PORT}."
 fi
 
+echo "Testing NAT redirect locally on port ${PUBLIC_PORT}:"
+
+set +e
+curl \
+    --silent \
+    --show-error \
+    --max-time 10 \
+    -o /dev/null \
+    -w "HTTP %{http_code}\n" \
+    "http://127.0.0.1:${PUBLIC_PORT}/"
+NAT_CURL_STATUS=$?
+set -e
+
+echo
+
+if [[ "$NAT_CURL_STATUS" -ne 0 ]]; then
+    echo "The local NAT redirect check did not succeed."
+    echo "Confirm iptables rules and that no other service is bound to port ${PUBLIC_PORT}."
+fi
+
 log "analyst-bot setup completed"
 
 cat <<EOF
@@ -293,6 +353,7 @@ Branch:              $BRANCH
 Application folder:  $APP_DIR
 PM2 process:         $APP_NAME
 Application port:    $APP_PORT
+Public port:         $PUBLIC_PORT -> $APP_PORT
 Org slug:            devboxph
 
 Useful commands:
@@ -303,6 +364,8 @@ Useful commands:
   pm2 stop $APP_NAME
   cd $APP_DIR
   git status
+  sudo iptables -t nat -S
+  sudo netfilter-persistent save
 
 .env lives at $APP_DIR/.env (created from .env.example on first run if it
 didn't exist, left untouched on reruns). To change values or rotate
@@ -310,6 +373,6 @@ secrets later:
   \$EDITOR $APP_DIR/.env
   pm2 restart $APP_NAME --update-env
 
-No NAT redirect was configured. Ensure the instance security group,
-reverse proxy, ALB, or portal shell can reach port $APP_PORT.
+Port $PUBLIC_PORT is redirected to $APP_PORT with iptables NAT. Ensure the
+instance security group permits inbound TCP $PUBLIC_PORT and SSH 22.
 EOF

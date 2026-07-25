@@ -1375,12 +1375,42 @@ function renderStorySetProcessFlow(processFlow) {
 }
 
 app.use((err, req, res, next) => {
-  const status = err.status || 500;
+  const normalized = normalizeServerError(err);
+  const status = normalized.status;
   res.status(status).json({
     success: false,
-    message: status >= 500 ? err.message || 'Analysis failed.' : err.message
+    message: normalized.message
   });
 });
+
+function normalizeServerError(err) {
+  const status = Number(err.status || err.statusCode || 500);
+  const rawMessage = String(err.message || '').trim();
+  const rawType = String(err.type || err.name || '').trim();
+  const combined = `${rawType} ${rawMessage}`;
+  const isTimeout =
+    status === 504 ||
+    /timeout|timed out|gateway time-?out|etimedout|abort/i.test(combined);
+
+  if (isTimeout) {
+    return {
+      status: status >= 400 ? status : 504,
+      message: 'Ari timed out while reading and analyzing the document. The file may be large or the analysis request took longer than the server gateway allows. Please try again, or split very large supporting files before analysis.'
+    };
+  }
+
+  if (status >= 500) {
+    return {
+      status,
+      message: rawMessage || 'Ari hit a server error while preparing the analysis. Please try again; if it repeats, check the server logs.'
+    };
+  }
+
+  return {
+    status,
+    message: rawMessage || 'Ari could not complete the request.'
+  };
+}
 
 app.listen(PORT, () => {
   console.log(`Ari running on http://localhost:${PORT}`);

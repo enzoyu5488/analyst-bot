@@ -696,7 +696,27 @@ async function parseApiResponse(response) {
   const contentType = response.headers.get('content-type') || '';
   if (contentType.includes('application/json')) return response.json();
   const text = await response.text();
-  return { message: text || `${response.status} ${response.statusText}` };
+  return { message: humanizeHttpError(response, text) };
+}
+
+function humanizeHttpError(response, text) {
+  const compactText = String(text || '').replace(/\s+/g, ' ').trim();
+  const strippedText = compactText.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+  const messageSource = strippedText || compactText || `${response.status} ${response.statusText}`;
+  const looksLikeGatewayTimeout =
+    response.status === 504 ||
+    /gateway time-?out/i.test(messageSource) ||
+    /upstream.*timed out/i.test(messageSource);
+
+  if (looksLikeGatewayTimeout) {
+    return 'Ari timed out while reading and analyzing the document. The upload may be large or the AI request took longer than the server gateway allows. Please try again, or split very large supporting files before analysis.';
+  }
+
+  if (response.status >= 500) {
+    return 'Ari hit a server error while preparing the analysis. Please try again; if it repeats, check the server logs.';
+  }
+
+  return messageSource;
 }
 
 async function json(url, options) {
