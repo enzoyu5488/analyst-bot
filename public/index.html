@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Devbox Analyst Bot</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header>
+    <div>
+      <div class="brand">DEVBOX</div>
+      <div class="tagline">ARI ANALYST BOT</div>
+    </div>
+    <div class="header-tools">
+      <div id="healthBadge" class="health-badge">Checking AI setup...</div>
+      <div class="ari-badge"><img src="/assets/ari-mascot.png" alt="Ari"><span>Ari</span></div>
+    </div>
+  </header>
+
+  <main>
+    <section class="intro">
+      <h1>Ari technical analysis and manday estimator</h1>
+      <p>Ari captures a business request in plain language and turns it into MEAN/Ionic scope, risks, questions, delivery effort, and a Lex-ready contract handoff.</p>
+    </section>
+
+    <section class="layout">
+      <form id="analysisForm" class="panel">
+        <div class="mode-row ari-contract-mode-row" role="radiogroup" aria-label="Contract path">
+          <label class="mode active">
+            <input type="radio" name="contractPath" value="details" checked>
+            <strong>Generate contract</strong>
+            <span>Ari prepares the package, then Lex drafts the contract.</span>
+          </label>
+          <label class="mode">
+            <input type="radio" name="contractPath" value="refine">
+            <strong>Refine draft</strong>
+            <span>Ari analyzes context, then Lex refines an uploaded draft.</span>
+          </label>
+          <label class="mode">
+            <input type="radio" name="contractPath" value="approved-upload">
+            <strong>Record approved</strong>
+            <span>Ari captures metadata, then Lex tracks an approved contract.</span>
+          </label>
+        </div>
+
+        <div id="requestTypeRow" class="mode-row" role="radiogroup" aria-label="Request type">
+          <label class="mode active">
+            <input type="radio" name="projectType" value="new-tool" checked>
+            <strong>New tool</strong>
+            <span>Something we will build from scratch.</span>
+          </label>
+          <label class="mode">
+            <input type="radio" name="projectType" value="extension">
+            <strong>Extension</strong>
+            <span>A change to an existing tool.</span>
+          </label>
+        </div>
+
+        <div class="grid">
+          <label>Customer name<input name="customerName" required placeholder="Rockwell Land Corporation"></label>
+          <label>Requester name<input name="requesterName" placeholder="Jane Santos"></label>
+          <label>Business unit<input name="businessUnit" placeholder="Sales Operations"></label>
+        </div>
+
+        <div id="toolNameField" class="grid single">
+          <label>Tool or project name<input name="toolName" required placeholder="Partner Onboarding Tracker"></label>
+        </div>
+
+        <label id="existingToolField" class="hidden">Existing repository or documentation
+          <textarea name="existingToolReference" rows="3" placeholder="Paste a GitHub/GitLab URL, Confluence/SharePoint link, or describe where the current tool lives."></textarea>
+        </label>
+
+        <section id="refineUploadPrompt" class="refine-upload-prompt hidden">
+          <h2 id="documentUploadTitle">Upload the draft or supporting file</h2>
+          <p id="documentUploadHelp">Ari will read the file first and only ask a few questions if something is unclear.</p>
+        </section>
+
+        <label class="requirements-field">What problem should this solve?
+          <textarea name="businessProblem" rows="4" placeholder="Example: The team tracks onboarding in spreadsheets and loses status updates."></textarea>
+        </label>
+
+        <label class="requirements-field">What outcome should users get?
+          <textarea name="desiredOutcome" rows="4" placeholder="Example: Managers can see pending onboarding steps, owners, due dates, and blockers."></textarea>
+        </label>
+
+        <label class="requirements-field">Who will use it?
+          <textarea name="users" rows="3" placeholder="Example: Sales coordinators, account managers, finance approvers, admins."></textarea>
+        </label>
+
+        <label class="requirements-field">Requested features
+          <textarea name="keyFeatures" rows="6" placeholder="Use everyday language. Bullet points are fine."></textarea>
+        </label>
+
+        <label class="requirements-field">Data, reports, and integrations
+          <textarea name="dataAndIntegrations" rows="4" placeholder="Example: Needs customer records, exports to Excel, maybe connects to CRM or email."></textarea>
+        </label>
+
+        <label class="requirements-field">Constraints, risks, or policies
+          <textarea name="constraints" rows="3" placeholder="Example: SSO required, audit trail, only managers can approve, must work on mobile."></textarea>
+        </label>
+
+        <div class="grid">
+          <label class="requirements-field">Target timeline<input name="timeline" placeholder="Needed before Q4 planning"></label>
+          <label class="requirements-field">Assumptions to include<input name="assumptions" placeholder="Reuse current login, use existing database, etc."></label>
+          <label id="supportingFilesLabel">Supporting files<input name="supportingFiles" type="file" multiple accept=".pdf,.docx,.txt,.html,.md,.csv,.json"></label>
+        </div>
+
+        <section id="questionsPanel" class="questions-panel hidden">
+          <h2>Ari's questions</h2>
+          <div id="questionsList"></div>
+        </section>
+
+        <div class="form-actions">
+          <button id="submitBtn" type="submit">Ask Ari</button>
+          <button id="skipQuestionsBtn" class="secondary hidden" type="button">Skip questions</button>
+        </div>
+        <div id="status" class="status"></div>
+      </form>
+
+      <aside class="panel output-panel">
+        <div class="output-head">
+          <h2>Analysis</h2>
+          <div class="output-actions">
+            <button id="copyBtn" class="secondary hidden" type="button">Copy</button>
+            <button id="showLexBtn" class="hidden" type="button">Send to Lex</button>
+          </div>
+        </div>
+        <div id="output" class="empty-state">Your estimate will appear here after analysis.</div>
+        <form id="lexForm" class="lex-panel hidden">
+          <h3>Lex contract handoff</h3>
+          <p class="muted">Ari prepares the scope, user stories, technical summary, billing basis, and process flow. Lex only generates and manages the contract from this package.</p>
+          <div class="mode-row lex-mode-row" role="radiogroup" aria-label="Lex handoff mode">
+            <label class="mode active">
+              <input type="radio" name="draftingMode" value="details" checked>
+              <strong>Generate from Ari</strong>
+              <span>Create a new editable contract from Ari's package.</span>
+            </label>
+            <label class="mode">
+              <input type="radio" name="draftingMode" value="refine">
+              <strong>Refine draft</strong>
+              <span>Upload a draft and let Lex improve it using Ari's package.</span>
+            </label>
+            <label class="mode">
+              <input type="radio" name="draftingMode" value="approved-upload">
+              <strong>Record approved</strong>
+              <span>Upload a signed/offline contract for Lex to parse and track.</span>
+            </label>
+          </div>
+          <div class="grid two">
+            <label>Customer name<input name="customerName" required placeholder="Rockwell Land Corporation"></label>
+            <label>Project name<input name="projectName" required></label>
+          </div>
+          <div class="grid three">
+            <label>Supplier entity
+              <select name="supplierEntity" id="supplierEntity">
+                <option>Devbox Solutions Inc.</option>
+                <option>Kaitech Solutions OPC</option>
+                <option>Kaitech Pty Ltd</option>
+              </select>
+            </label>
+            <label>Supplier signatory<input name="signatoryName" id="signatoryName" required></label>
+            <label>Signatory title<input name="signatoryTitle" id="signatoryTitle" required></label>
+          </div>
+          <div class="grid two">
+            <label>Currency<select name="currency" id="currency"><option>PHP</option><option>AUD</option><option>USD</option></select></label>
+            <label>Estimate basis
+              <select name="estimateBasis" id="estimateBasis">
+                <option value="max">Max mandays</option>
+                <option value="mid">Midpoint mandays</option>
+                <option value="min">Min mandays</option>
+              </select>
+            </label>
+          </div>
+          <div class="grid two">
+            <label>Monthly running cost<input name="monthlyRunningCost" type="number" min="0" step="1" value="0" required></label>
+            <label class="check"><input name="vatExclusive" type="checkbox" value="true" checked> VAT exclusive</label>
+          </div>
+          <div id="lexGenerateFields">
+            <label>Reference contract for Lex<input name="referenceContract" type="file" accept=".pdf,.docx,.txt,.html"></label>
+            <label>User stories file for Lex<input name="userStoriesFile" type="file" accept=".pdf,.docx,.txt,.html,.md,.csv"></label>
+          </div>
+          <div id="lexRefineFields" class="hidden">
+            <div id="lexSourceReuseNotice" class="source-reuse-notice hidden"></div>
+            <label id="lexDraftContractLabel">Draft contract to refine<input name="draftContract" type="file" accept=".pdf,.docx,.txt,.html"></label>
+            <label>Refinement notes<textarea name="refinementNotes" rows="4" placeholder="What should Lex preserve, improve, correct, or emphasize in the uploaded draft?"></textarea></label>
+          </div>
+          <div id="lexApprovedFields" class="hidden">
+            <div id="lexApprovedSourceReuseNotice" class="source-reuse-notice hidden"></div>
+            <label id="lexCompletedContractLabel">Approved completed contract<input name="completedContract" type="file" accept=".pdf,.docx,.txt,.html"></label>
+            <label>Approved import notes<textarea name="approvedImportNotes" rows="4" placeholder="Optional internal notes, e.g. already signed offline, billing reminder, renewal watch-out."></textarea></label>
+          </div>
+          <label>Notes for Lex<textarea name="notesForLex" rows="4" placeholder="Anything commercial, legal, or delivery-specific Lex should know before drafting."></textarea></label>
+          <div id="ratePanel" class="rate-panel hidden">
+            <label>Daily rate to use for this contract<input name="dayRate" id="finalDayRate" type="number" min="1" step="1" inputmode="numeric"></label>
+          </div>
+          <button id="sendLexBtn" type="submit">Create contract in Lex</button>
+          <div id="lexStatus" class="status"></div>
+        </form>
+      </aside>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>
