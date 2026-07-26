@@ -312,6 +312,11 @@ async function handleChatText(rawValue) {
     return;
   }
 
+  if (chatStep === 'source') {
+    handleSourceFreeText(value);
+    return;
+  }
+
   if (chatStep && chatStep.startsWith('lex-')) {
     await handleLexChatAnswer(value, attachedNames);
     return;
@@ -570,9 +575,12 @@ async function showMyStorySets() {
 }
 
 function applyStorySetToChat(story) {
+  chatState.selectedStory = story;
   chatState.customerName = story.customerName || '';
   chatState.toolName = story.projectName || '';
   chatState.businessProblem = story.summary || '';
+  chatState.desiredOutcome = inferOutcomeFromStory(story);
+  chatState.users = inferUsersFromStory(story);
   chatState.keyFeatures = [
     ...(story.userStories || []).map(item => `As a ${item.role}, I want ${item.goal}, so that ${item.benefit}.`),
     story.processFlow?.summary ? `Previous process flow: ${story.processFlow.summary}` : ''
@@ -580,6 +588,60 @@ function applyStorySetToChat(story) {
   chatState.assumptions = `Continuing from Ari story set ${story.id}. Prior confidence: ${story.confidence || 'not stated'}.`;
   addBotMessage(`Okay. I will use the previous ${story.customerName} / ${story.projectName || 'project'} context as a starting point.`);
   updateChatConfidence();
+}
+
+function handleSourceFreeText(value) {
+  if (isPreviousStoryQuestion(value) && chatState.selectedStory) {
+    addPreviousStoryRecap(chatState.selectedStory);
+    addBotMessage('You can choose what to base the next step on below, or tell me what changed since that last summary.');
+    askSourceMaterial();
+    return;
+  }
+  if (chatState.selectedStory) {
+    appendToField('assumptions', `Continuation note from user: ${value}`);
+    addBotMessage('Got it. I will carry that forward with the previous story context. What should I base the next step on?');
+    renderChatChips([
+      { label: 'Start from scratch', value: 'scratch' },
+      { label: 'Draft or supporting docs', value: 'draft' },
+      { label: 'Approved contract to read', value: 'approved' },
+      { label: 'Existing tool or repository', value: 'extension' }
+    ]);
+    return;
+  }
+  addBotMessage('Please choose one of the options below so I know whether this is from scratch, from documents, an approved contract, or an existing tool.');
+  askSourceMaterial();
+}
+
+function isPreviousStoryQuestion(value) {
+  return /\b(last|previous|prior|recap|summary|where.*left|what.*had|what.*generated|what.*story|what.*done)\b/i.test(String(value || ''));
+}
+
+function addPreviousStoryRecap(story) {
+  const stories = Array.isArray(story.userStories) ? story.userStories : [];
+  const storyPreview = stories.slice(0, 3).map(item => {
+    const role = item.role || 'user';
+    const goal = item.goal || 'the requested capability';
+    const benefit = item.benefit || 'the business outcome is achieved';
+    return `As a ${role}, I want ${goal}, so that ${benefit}.`;
+  });
+  const pieces = [
+    `Last Ari summary for ${story.customerName || 'this customer'} / ${story.projectName || 'this project'}: ${story.summary || 'No summary text was saved.'}`,
+    story.totalMinDays || story.totalMaxDays ? `Prior estimate: ${story.totalMinDays || 0}-${story.totalMaxDays || 0} mandays, ${story.confidence || 'confidence not stated'}.` : '',
+    story.processFlow?.summary ? `Process flow: ${story.processFlow.summary}` : '',
+    storyPreview.length ? `User stories captured: ${storyPreview.join(' ')}` : '',
+    Array.isArray(story.openQuestions) && story.openQuestions.length ? `Open questions: ${story.openQuestions.slice(0, 3).join(' ')}` : ''
+  ].filter(Boolean);
+  addBotMessage(pieces.join('\n\n'));
+}
+
+function inferOutcomeFromStory(story) {
+  const benefits = (story.userStories || []).map(item => item.benefit).filter(Boolean);
+  return benefits.slice(0, 4).join('\n');
+}
+
+function inferUsersFromStory(story) {
+  const roles = (story.userStories || []).map(item => item.role).filter(Boolean);
+  return Array.from(new Set(roles)).join(', ');
 }
 
 function askSourceMaterial() {
