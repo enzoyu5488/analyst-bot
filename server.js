@@ -8,6 +8,8 @@ const msal = require('@azure/msal-node');
 const multer = require('multer');
 const OpenAI = require('openai');
 const { MongoClient } = require('mongodb');
+const { S3Client, GetObjectCommand, PutObjectCommand } = require('@aws-sdk/client-s3');
+const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const mammoth = require('mammoth');
 const pdfParse = require('pdf-parse');
 const fs = require('fs/promises');
@@ -38,10 +40,16 @@ const MONGODB_URI = process.env.MONGODB_URI || '';
 const MONGODB_DB_NAME = process.env.MONGODB_DB_NAME || 'analyst_bot';
 const MONGODB_STORIES_COLLECTION = process.env.MONGODB_STORIES_COLLECTION || process.env.MONGODB_COLLECTION || 'customer_user_stories';
 const ORG_SLUG = normalizeOrgSlug(process.env.ORG_SLUG || 'devboxph');
+const S3_BUCKET = String(process.env.ARI_S3_BUCKET || process.env.S3_BUCKET || '').trim();
+const S3_REGION = String(process.env.ARI_S3_REGION || process.env.S3_REGION || process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || '').trim();
+const S3_PREFIX = cleanS3Prefix(process.env.ARI_S3_PREFIX || process.env.S3_PREFIX || 'analyst-bot');
+const S3_ENDPOINT = String(process.env.ARI_S3_ENDPOINT || '').trim();
+const S3_FORCE_PATH_STYLE = parseBooleanEnv('ARI_S3_FORCE_PATH_STYLE', false);
 
 let openai;
 let msalClient;
 let mongoClient;
+let s3Client;
 let storiesIndexesReady = false;
 const analysisJobs = new Map();
 const clarificationJobs = new Map();
@@ -179,7 +187,8 @@ app.post('/api/analyses', upload.array('supportingFiles', 8), async (req, res, n
     ensureSupportingFileForDocumentLedPath(payload, req.files || []);
     const files = await extractUploadedFiles(req.files || []);
     const analysis = await createTechnicalAnalysis(payload, files);
-    const savedStorySet = await saveCustomerUserStories(payload, analysis, req.session.user);
+    const persistedDocuments = await persistUploadedDocuments(req.files || [], payload, req.session.user);
+    const savedStorySet = await saveCustomerUserStories(payload, analysis, req.session.user, persistedDocuments);
     res.json({ success: true, analysis, savedStorySet });
   } catch (error) {
     next(error);
@@ -193,7 +202,8 @@ app.post('/api/analysis-jobs', upload.array('supportingFiles', 8), async (req, r
     const payload = normalizeRequest(req.body);
     ensureSupportingFileForDocumentLedPath(payload, req.files || []);
     const files = await extractUploadedFiles(req.files || []);
-    const job = createAnalysisJob(payload, files, req.session.user);
+    const persistedDocuments = await persistUploadedDocuments(req.files || [], payload, req.session.user);
+    const job = createAnalysisJob(payload, files, req.session.user, persistedDocuments);
     res.status(202).json({ success: true, job: clientAnalysisJob(job) });
   } catch (error) {
     next(error);
@@ -277,6 +287,21 @@ app.get('/user-stories/:storySetId', async (req, res, next) => {
   } catch (error) { next(error); }
 });
 
+app.get('/user-stories/:storySetId/summary-file', async (req, res, next) => {
+  try {
+    const storySet = await getStorySetById(req.params.storySetId);
+    if (!storySet.summaryFile?.bucket || !storySet.summaryFile?.key) {
+      res.redirect(`/user-stories/${encodeURIComponent(storySet.id)}`);
+      return;
+    }
+    const signedUrl = await getSignedUrl(getS3Client(), new GetObjectCommand({
+      Bucket: storySet.summaryFile.bucket,
+      Key: storySet.summaryFile.key
+    }), { expiresIn: Number(process.env.ARI_S3_SIGNED_URL_SECONDS || 900) });
+    res.redirect(signedUrl);
+  } catch (error) { next(error); }
+});
+
 app.post('/api/clarifying-questions', upload.array('supportingFiles', 8), async (req, res, next) => {
   try {
     const payload = normalizeRequest(req.body);
@@ -337,6 +362,8 @@ app.post('/api/lex-handoffs', upload.fields([
       throw Object.assign(new Error(payload.message || `Lex returned ${lexResponse.status}.`), { status: lexResponse.status });
     }
 
+    await markStorySetSentToLex(handoff.savedStorySet?.id, payload);
+
     res.status(lexResponse.status).json({ success: true, lex: payload, lexApiBaseUrl: LEX_API_BASE_URL });
   } catch (error) {
     next(error);
@@ -395,6 +422,7 @@ function normalizeRequest(body) {
     constraints: clean(body.constraints),
     timeline: clean(body.timeline),
     assumptions: clean(body.assumptions),
+    ariConfidence: clean(body.ariConfidence),
     previousStoryUpdate,
     clarificationAnswers: normalizeClarificationAnswers(body.clarificationAnswers)
   };
@@ -840,6 +868,84 @@ async function cleanupFiles(files) {
   await Promise.all(files.map(file => fs.unlink(file.path).catch(() => {})));
 }
 
+async function persistUploadedDocuments(files, request, user) {
+  if (!isS3Configured() || !files.length) return [];
+  const uploadedAt = new Date().toISOString();
+  const uploadedByEmail = String(user?.email || '').trim().toLowerCase();
+  const customerKey = normalizeOrgSlug(request.customerName || 'unknown-customer');
+  const projectKey = normalizeOrgSlug(request.toolName || request.contractPath || 'ari-analysis');
+  const documents = [];
+  for (const file of files) {
+    const key = [
+      S3_PREFIX,
+      ORG_SLUG,
+      customerKey,
+      projectKey,
+      `${Date.now()}-${randomId()}-${safeS3Filename(file.originalname)}`
+    ].filter(Boolean).join('/');
+    const body = await fs.readFile(file.path);
+    await getS3Client().send(new PutObjectCommand({
+      Bucket: S3_BUCKET,
+      Key: key,
+      Body: body,
+      ContentType: file.mimetype || 'application/octet-stream',
+      Metadata: {
+        org_slug: ORG_SLUG,
+        customer: safeS3Metadata(request.customerName),
+        project: safeS3Metadata(request.toolName),
+        uploaded_by: safeS3Metadata(uploadedByEmail)
+      }
+    }));
+    documents.push({
+      storage: 's3',
+      bucket: S3_BUCKET,
+      key,
+      region: S3_REGION,
+      originalName: file.originalname,
+      mimeType: file.mimetype,
+      size: Number(file.size || 0),
+      uploadedAt,
+      uploadedByEmail
+    });
+  }
+  return documents;
+}
+
+async function persistSummaryFile(record) {
+  if (!isS3Configured()) return null;
+  const key = [
+    S3_PREFIX,
+    record.orgSlug || ORG_SLUG,
+    normalizeOrgSlug(record.customerName || 'unknown-customer'),
+    normalizeOrgSlug(record.projectName || 'ari-summary'),
+    record.id,
+    'ari-summary.html'
+  ].filter(Boolean).join('/');
+  const body = Buffer.from(renderStorySetSummaryArtifact(record), 'utf8');
+  await getS3Client().send(new PutObjectCommand({
+    Bucket: S3_BUCKET,
+    Key: key,
+    Body: body,
+    ContentType: 'text/html; charset=utf-8',
+    Metadata: {
+      org_slug: ORG_SLUG,
+      customer: safeS3Metadata(record.customerName),
+      project: safeS3Metadata(record.projectName),
+      artifact: 'ari-summary'
+    }
+  }));
+  return {
+    storage: 's3',
+    bucket: S3_BUCKET,
+    key,
+    region: S3_REGION,
+    originalName: 'ari-summary.html',
+    mimeType: 'text/html',
+    size: body.length,
+    uploadedAt: new Date().toISOString()
+  };
+}
+
 async function createTechnicalAnalysis(request, files) {
   if (!hasUsableOpenAIKey()) {
     throw Object.assign(new Error('OPENAI_API_KEY is not configured. Add it to .env before running an analysis.'), { status: 500 });
@@ -878,7 +984,7 @@ async function createTechnicalAnalysis(request, files) {
   return JSON.parse(response.output_text);
 }
 
-function createAnalysisJob(request, files, user) {
+function createAnalysisJob(request, files, user, persistedDocuments = []) {
   pruneAnalysisJobs();
   const job = {
     id: randomId(),
@@ -890,14 +996,14 @@ function createAnalysisJob(request, files, user) {
     savedStorySet: null
   };
   analysisJobs.set(job.id, job);
-  runAnalysisJob(job, request, files, user);
+  runAnalysisJob(job, request, files, user, persistedDocuments);
   return job;
 }
 
-async function runAnalysisJob(job, request, files, user) {
+async function runAnalysisJob(job, request, files, user, persistedDocuments = []) {
   try {
     const analysis = await createTechnicalAnalysis(request, files);
-    const savedStorySet = await saveCustomerUserStories(request, analysis, user);
+    const savedStorySet = await saveCustomerUserStories(request, analysis, user, persistedDocuments);
     Object.assign(job, {
       status: 'COMPLETE',
       message: 'Analysis ready.',
@@ -1392,8 +1498,36 @@ function storageStatus() {
     configured: Boolean(MONGODB_URI),
     orgSlug: ORG_SLUG,
     database: MONGODB_URI ? MONGODB_DB_NAME : '',
-    collection: MONGODB_URI ? MONGODB_STORIES_COLLECTION : ''
+    collection: MONGODB_URI ? MONGODB_STORIES_COLLECTION : '',
+    documents: s3StorageStatus()
   };
+}
+
+function s3StorageStatus() {
+  return {
+    configured: isS3Configured(),
+    bucket: S3_BUCKET || '',
+    region: S3_REGION || '',
+    prefix: S3_BUCKET ? S3_PREFIX : ''
+  };
+}
+
+function isS3Configured() {
+  return Boolean(S3_BUCKET && S3_REGION);
+}
+
+function getS3Client() {
+  if (!isS3Configured()) {
+    throw Object.assign(new Error('S3 document storage is not configured. Add S3_BUCKET and S3_REGION to .env.'), { status: 503 });
+  }
+  if (!s3Client) {
+    s3Client = new S3Client({
+      region: S3_REGION,
+      endpoint: S3_ENDPOINT || undefined,
+      forcePathStyle: S3_FORCE_PATH_STYLE
+    });
+  }
+  return s3Client;
 }
 
 async function getStoriesCollection() {
@@ -1414,7 +1548,7 @@ async function getStoriesCollection() {
   return collection;
 }
 
-async function saveCustomerUserStories(request, analysis, user) {
+async function saveCustomerUserStories(request, analysis, user, documents = []) {
   const contractPath = request.contractPath || 'details';
   const userStories = normalizeUserStories(analysis.draftedUserStories);
   if (!MONGODB_URI) {
@@ -1429,8 +1563,9 @@ async function saveCustomerUserStories(request, analysis, user) {
   const now = new Date();
   const createdByEmail = String(user?.email || '').trim().toLowerCase();
   const createdByName = clean(user?.name || createdByEmail || 'Ari user');
+  const id = randomId();
   const record = {
-    id: randomId(),
+    id,
     orgSlug: ORG_SLUG,
     createdByEmail,
     createdByName,
@@ -1456,14 +1591,36 @@ async function saveCustomerUserStories(request, analysis, user) {
     openQuestions: Array.isArray(analysis.openQuestions) ? analysis.openQuestions : [],
     recommendation: analysis.recommendation || '',
     analysisSnapshot: analysis,
+    status: {
+      state: 'summary_generated',
+      label: 'Summary generated',
+      confidence: analysis.confidence || request.ariConfidence || '',
+      updatedAt: now
+    },
+    statusHistory: [
+      {
+        state: 'starting',
+        label: 'Starting',
+        confidence: request.ariConfidence || '',
+        updatedAt: now
+      },
+      {
+        state: 'summary_generated',
+        label: 'Summary generated',
+        confidence: analysis.confidence || request.ariConfidence || '',
+        updatedAt: now
+      }
+    ],
     source: {
       toolName: request.toolName,
       keyFeatures: request.keyFeatures || '',
       createdBy: createdByEmail || createdByName
     },
+    documents: normalizeStoredDocuments(documents),
     createdAt: now,
     updatedAt: now
   };
+  record.summaryFile = await persistSummaryFile(record);
 
   const collection = await getStoriesCollection();
   await collection.insertOne(record);
@@ -1479,6 +1636,34 @@ async function getStorySetById(storySetId) {
   return clientStorySet(record);
 }
 
+async function markStorySetSentToLex(storySetId, lexPayload) {
+  const id = clean(storySetId);
+  if (!id || !MONGODB_URI) return;
+  const now = new Date();
+  const contractId = clean(lexPayload?.engagement?.contractId || lexPayload?.contractId || '');
+  const lexJobId = clean(lexPayload?.job?.id || '');
+  const status = {
+    state: 'sent_to_lex',
+    label: 'Sent to Lex',
+    confidence: '',
+    contractId,
+    lexJobId,
+    updatedAt: now
+  };
+  const collection = await getStoriesCollection();
+  await collection.updateOne(
+    { orgSlug: ORG_SLUG, id },
+    {
+      $set: {
+        status,
+        lexHandoff: { contractId, lexJobId, sentAt: now },
+        updatedAt: now
+      },
+      $push: { statusHistory: status }
+    }
+  );
+}
+
 function normalizeUserStories(stories) {
   if (!Array.isArray(stories)) return [];
   return stories.map(story => ({
@@ -1489,6 +1674,62 @@ function normalizeUserStories(stories) {
       ? story.acceptanceCriteria.map(clean).filter(Boolean)
       : []
   })).filter(story => story.role || story.goal || story.benefit || story.acceptanceCriteria.length);
+}
+
+function normalizeStoredDocuments(documents) {
+  if (!Array.isArray(documents)) return [];
+  return documents.map(item => ({
+    storage: clean(item.storage || 's3'),
+    bucket: clean(item.bucket),
+    key: clean(item.key),
+    region: clean(item.region),
+    originalName: clean(item.originalName),
+    mimeType: clean(item.mimeType),
+    size: Number(item.size || 0),
+    uploadedAt: item.uploadedAt || '',
+    uploadedByEmail: clean(item.uploadedByEmail).toLowerCase()
+  })).filter(item => item.storage && item.bucket && item.key);
+}
+
+function normalizeStoryStatus(status, fallbackConfidence = '') {
+  if (!status || typeof status !== 'object') {
+    return {
+      state: 'summary_generated',
+      label: 'Summary generated',
+      confidence: fallbackConfidence || '',
+      updatedAt: ''
+    };
+  }
+  return {
+    state: clean(status.state || 'summary_generated'),
+    label: clean(status.label || 'Summary generated'),
+    confidence: clean(status.confidence || fallbackConfidence || ''),
+    contractId: clean(status.contractId || ''),
+    lexJobId: clean(status.lexJobId || ''),
+    updatedAt: status.updatedAt || ''
+  };
+}
+
+function normalizeStatusHistory(history, fallbackConfidence = '') {
+  if (Array.isArray(history) && history.length) {
+    return history.map(item => normalizeStoryStatus(item, fallbackConfidence));
+  }
+  return [normalizeStoryStatus(null, fallbackConfidence)];
+}
+
+function normalizeSummaryFile(summaryFile, storySetId) {
+  if (!summaryFile?.bucket || !summaryFile?.key) return null;
+  return {
+    storage: clean(summaryFile.storage || 's3'),
+    bucket: clean(summaryFile.bucket),
+    key: clean(summaryFile.key),
+    region: clean(summaryFile.region),
+    originalName: clean(summaryFile.originalName || 'ari-summary.html'),
+    mimeType: clean(summaryFile.mimeType || 'text/html'),
+    size: Number(summaryFile.size || 0),
+    uploadedAt: summaryFile.uploadedAt || '',
+    url: storySummaryFileUrl(storySetId)
+  };
 }
 
 function clientStorySet(record) {
@@ -1513,6 +1754,12 @@ function clientStorySet(record) {
     openQuestions: record.openQuestions || [],
     recommendation: record.recommendation || '',
     analysisSnapshot: record.analysisSnapshot || null,
+    status: normalizeStoryStatus(record.status, record.confidence),
+    statusHistory: normalizeStatusHistory(record.statusHistory, record.confidence),
+    summaryFile: normalizeSummaryFile(record.summaryFile, record.id),
+    summaryFileUrl: record.summaryFile?.key ? storySummaryFileUrl(record.id) : '',
+    lexHandoff: record.lexHandoff || null,
+    documents: normalizeStoredDocuments(record.documents),
     createdByEmail: record.createdByEmail || '',
     createdByName: record.createdByName || '',
     createdBy: record.source?.createdBy || '',
@@ -1530,6 +1777,37 @@ function normalizeOrgSlug(value) {
     .toLowerCase()
     .replace(/[^a-z0-9-]+/g, '-')
     .replace(/^-+|-+$/g, '') || 'devboxph';
+}
+
+function cleanS3Prefix(value) {
+  return String(value || '')
+    .trim()
+    .replace(/^\/+|\/+$/g, '')
+    .replace(/\/{2,}/g, '/');
+}
+
+function safeS3Filename(value) {
+  const parsed = path.parse(String(value || 'upload'));
+  const base = parsed.name
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 80) || 'upload';
+  const ext = parsed.ext
+    .toLowerCase()
+    .replace(/[^a-z0-9.]/g, '')
+    .slice(0, 12);
+  return `${base}${ext}`;
+}
+
+function safeS3Metadata(value) {
+  return String(value || '')
+    .normalize('NFKD')
+    .replace(/[^\x20-\x7E]+/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 120);
 }
 
 function inferProjectNameFromAnalysis(analysis) {
@@ -1551,6 +1829,10 @@ function storySetUrl(id) {
   return id ? `${ARI_PUBLIC_BASE_URL}/user-stories/${encodeURIComponent(id)}` : '';
 }
 
+function storySummaryFileUrl(id) {
+  return id ? `${ARI_PUBLIC_BASE_URL}/user-stories/${encodeURIComponent(id)}/summary-file` : '';
+}
+
 function renderStorySetPage(storySet) {
   return `<!doctype html>
 <html lang="en">
@@ -1568,10 +1850,13 @@ function renderStorySetPage(storySet) {
     main { max-width: 980px; margin: 24px auto; padding: 0 20px 36px; }
     section { background: #fff; border: 1px solid var(--line); border-radius: 8px; padding: 18px; margin-bottom: 14px; }
     h1, h2, h3 { color: var(--navy); margin-top: 0; }
-    h1 { font-size: 28px; margin-bottom: 6px; }
-    p, li { line-height: 1.45; }
-    .meta { color: var(--muted); margin: 0; }
-    .story { background: var(--soft); }
+	    h1 { font-size: 28px; margin-bottom: 6px; }
+	    p, li { line-height: 1.45; }
+	    .meta { color: var(--muted); margin: 0; }
+	    .status-pill { display: inline-flex; align-items: center; gap: 7px; margin-top: 12px; border: 1px solid #b9e6df; border-radius: 999px; background: #eefaf8; color: var(--navy); padding: 7px 10px; font-weight: 800; }
+	    .summary-link { display: inline-block; margin-top: 12px; border: 1px solid #14a99a; border-radius: 6px; color: #087a70; font-weight: 900; padding: 10px 12px; text-decoration: none; }
+	    .readonly { border-left: 4px solid #14a99a; background: #f2fbfa; }
+	    .story { background: var(--soft); }
     .story strong { color: var(--navy); }
     .process-flow { display: grid; gap: 10px; }
     .step { border-left: 4px solid var(--teal); padding-left: 12px; }
@@ -1583,14 +1868,17 @@ function renderStorySetPage(storySet) {
     <div class="tagline">ARI USER STORY SUMMARY</div>
   </header>
   <main>
-    <section>
-      <h1>${escapeText(storySet.projectName || 'User Stories')}</h1>
-      <p class="meta">${escapeText(storySet.customerName)}${storySet.createdAt ? ` &middot; ${escapeText(new Date(storySet.createdAt).toLocaleString('en-PH', { dateStyle: 'medium', timeStyle: 'short' }))}` : ''}</p>
-      <p>${escapeText(storySet.summary || 'No summary provided.')}</p>
-    </section>
-    <section>
-      <h2>Manday And Risk Summary</h2>
-      <p><strong>${escapeText(storySet.totalMinDays)}-${escapeText(storySet.totalMaxDays)} mandays</strong>${storySet.confidence ? ` (${escapeText(storySet.confidence)} confidence)` : ''}</p>
+	    <section>
+	      <h1>${escapeText(storySet.projectName || 'User Stories')}</h1>
+	      <p class="meta">${escapeText(storySet.customerName)}${storySet.createdAt ? ` &middot; ${escapeText(new Date(storySet.createdAt).toLocaleString('en-PH', { dateStyle: 'medium', timeStyle: 'short' }))}` : ''}</p>
+	      ${renderStorySetStatus(storySet)}
+	      ${storySet.status?.state === 'sent_to_lex' ? '<p class="readonly"><strong>Sent to Lex.</strong> Ari can show this saved package again, but it should not be changed from this stage.</p>' : ''}
+	      ${storySet.summaryFileUrl ? `<p><a class="summary-link" href="${escapeText(storySet.summaryFileUrl)}" target="_blank" rel="noopener">Open Ari S3 summary file</a></p>` : `<p>${escapeText(storySet.summary || 'No summary provided.')}</p>`}
+	    </section>
+	    ${storySet.summaryFileUrl ? '' : `
+	    <section>
+	      <h2>Manday And Risk Summary</h2>
+	      <p><strong>${escapeText(storySet.totalMinDays)}-${escapeText(storySet.totalMaxDays)} mandays</strong>${storySet.confidence ? ` (${escapeText(storySet.confidence)} confidence)` : ''}</p>
       ${renderStorySetList('Work Packages', (storySet.workPackages || []).map(pkg => `${pkg.name}: ${pkg.minDays}-${pkg.maxDays} mandays. ${pkg.description}`))}
       ${renderStorySetList('Risks', storySet.risks)}
       ${renderStorySetList('Open Questions', storySet.openQuestions)}
@@ -1602,10 +1890,11 @@ function renderStorySetPage(storySet) {
     </section>
     <section>
       <h2>${escapeText(storySet.processFlow?.title || 'Process Flow')}</h2>
-      <p>${escapeText(storySet.processFlow?.summary || 'No process flow summary provided.')}</p>
-      ${renderStorySetProcessFlow(storySet.processFlow)}
-    </section>
-  </main>
+	      <p>${escapeText(storySet.processFlow?.summary || 'No process flow summary provided.')}</p>
+	      ${renderStorySetProcessFlow(storySet.processFlow)}
+	    </section>
+	    `}
+	  </main>
 </body>
 </html>`;
 }
@@ -1620,10 +1909,43 @@ function renderStorySetStories(stories) {
   </article>`).join('');
 }
 
+function renderStorySetStatus(storySet) {
+  const current = storySet.status || {};
+  const history = Array.isArray(storySet.statusHistory) ? storySet.statusHistory : [];
+  return `
+    <div class="status-pill">${escapeText(current.label || 'Summary generated')}${current.confidence ? ` &middot; ${escapeText(current.confidence)} confidence` : ''}${current.contractId ? ` &middot; Contract ${escapeText(current.contractId)}` : ''}</div>
+    ${history.length ? `<ul>${history.map(item => `<li>${escapeText(item.label || item.state)}${item.confidence ? ` - ${escapeText(item.confidence)} confidence` : ''}${item.contractId ? ` - Contract ${escapeText(item.contractId)}` : ''}</li>`).join('')}</ul>` : ''}
+  `;
+}
+
 function renderStorySetList(title, items) {
   const list = Array.isArray(items) ? items.filter(Boolean) : [];
   if (!list.length) return '';
   return `<h3>${escapeText(title)}</h3><ul>${list.map(item => `<li>${escapeText(item)}</li>`).join('')}</ul>`;
+}
+
+function renderStorySetSummaryArtifact(storySet) {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Ari Summary - ${escapeText(storySet.projectName || 'User Stories')}</title>
+  <style>body{font-family:Arial,Helvetica,sans-serif;line-height:1.45;color:#1f2933;max-width:980px;margin:32px auto;padding:0 20px}h1,h2{color:#173b5b}.meta{color:#607080}.pill{display:inline-block;border:1px solid #b9e6df;border-radius:999px;background:#eefaf8;color:#173b5b;padding:7px 10px;font-weight:800}section{border-top:1px solid #d8e0e6;padding-top:14px;margin-top:18px}</style>
+</head>
+<body>
+  <h1>${escapeText(storySet.projectName || 'Ari Summary')}</h1>
+  <p class="meta">${escapeText(storySet.customerName || '')}</p>
+  <p class="pill">${escapeText(storySet.status?.label || 'Summary generated')}${storySet.status?.confidence ? ` - ${escapeText(storySet.status.confidence)} confidence` : ''}</p>
+  <section><h2>Summary</h2><p>${escapeText(storySet.summary || 'No summary provided.')}</p></section>
+  <section><h2>Mandays</h2><p>${escapeText(storySet.totalMinDays)}-${escapeText(storySet.totalMaxDays)} mandays${storySet.confidence ? ` (${escapeText(storySet.confidence)} confidence)` : ''}</p></section>
+  ${renderStorySetList('Work Packages', (storySet.workPackages || []).map(pkg => `${pkg.name}: ${pkg.minDays}-${pkg.maxDays} mandays. ${pkg.description}`))}
+  ${renderStorySetList('Risks', storySet.risks)}
+  ${renderStorySetList('Open Questions', storySet.openQuestions)}
+  <section><h2>User Stories</h2>${renderStorySetStories(storySet.userStories)}</section>
+  <section><h2>${escapeText(storySet.processFlow?.title || 'Process Flow')}</h2><p>${escapeText(storySet.processFlow?.summary || 'No process flow summary provided.')}</p>${renderStorySetProcessFlow(storySet.processFlow)}</section>
+</body>
+</html>`;
 }
 
 function renderStorySetProcessFlow(processFlow) {

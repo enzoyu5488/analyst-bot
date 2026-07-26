@@ -67,6 +67,14 @@ MONGODB_URI=
 MONGODB_DB_NAME=analyst_bot
 MONGODB_STORIES_COLLECTION=customer_user_stories
 ORG_SLUG=devboxph
+S3_BUCKET=
+S3_REGION=ap-southeast-1
+S3_PREFIX=analyst-bot
+AWS_ACCESS_KEY_ID=
+AWS_SECRET_ACCESS_KEY=
+ARI_S3_ENDPOINT=
+ARI_S3_FORCE_PATH_STYLE=false
+ARI_S3_SIGNED_URL_SECONDS=900
 ```
 
 ## Inputs
@@ -104,6 +112,30 @@ GET /api/customers/:customerName/user-stories
 Microsoft SSO follows the same environment pattern as contract-bot. Leave `MICROSOFT_CLIENT_ID` and `MICROSOFT_CLIENT_SECRET` blank for local unauthenticated development, or set them to require Microsoft sign-in. If Ari is served over plain HTTP through the port 80 NAT redirect, keep `SESSION_COOKIE_SECURE=false`; if Ari is behind HTTPS, set it to `true`.
 
 Saved analysis records include `orgSlug`; the default is `devboxph` so the same MongoDB database can support future tenants cleanly.
+
+## Source Document Storage
+
+When `S3_BUCKET` and `S3_REGION` are configured, Ari stores uploaded source documents in S3 before temporary local uploads are deleted. Ari also writes an HTML summary artifact to S3 for each generated summary. The MongoDB story record stores the S3 bucket/key, original filename, MIME type, size, uploader email, and timestamp so Ari can resume saved work with durable document references and a summary-file link.
+
+You can reuse the same bucket and AWS credentials from contract-bot. Use a different prefix/sub-folder for Ari, for example:
+
+```bash
+S3_BUCKET=same-bucket-as-contract-bot
+S3_REGION=ap-southeast-1
+S3_PREFIX=analyst-bot
+AWS_ACCESS_KEY_ID=same-access-key-as-contract-bot
+AWS_SECRET_ACCESS_KEY=same-secret-as-contract-bot
+```
+
+Those are the same S3 details contract-bot uses. Ari just needs its own prefix so files land under a separate folder.
+
+For AWS-hosted deployments, prefer an instance role or task role with `s3:PutObject` and `s3:GetObject` permission on the chosen prefix. `s3:GetObject` is used to create expiring summary-file links. For local development, set `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`. If using an S3-compatible service, set `ARI_S3_ENDPOINT` and `ARI_S3_FORCE_PATH_STYLE=true`.
+
+Saved stories carry lifecycle status:
+
+- `starting` with Ari's intake confidence before analysis
+- `summary_generated` with the generated summary confidence
+- `sent_to_lex` after Ari hands the package to Lex; Ari can show these again but should not change them
 
 ## Instance Setup
 

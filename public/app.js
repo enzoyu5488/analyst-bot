@@ -257,8 +257,7 @@ async function handleChatChoice(value, label) {
     }
     const story = (chatState.availableStories || []).find(item => item.id === value);
     if (story) {
-      applyStorySetToChat(story);
-      askPreviousStoryNextStep(story);
+      await resumePreviousStory(story);
     }
     return;
   }
@@ -267,6 +266,10 @@ async function handleChatChoice(value, label) {
     if (value === 'previous-use-as-is') {
       usePreviousStoryAsCurrent();
       askSummaryReview();
+      return;
+    }
+    if (value === 'previous-answer-questions') {
+      askPreviousStoryOpenQuestions();
       return;
     }
     if (value === 'previous-update') {
@@ -278,6 +281,13 @@ async function handleChatChoice(value, label) {
       await startLexHandoffChat();
       return;
     }
+    if (value === 'start-new') {
+      askSourceMaterial();
+      return;
+    }
+  }
+
+  if (chatStep === 'previous-story-readonly') {
     if (value === 'start-new') {
       askSourceMaterial();
       return;
@@ -339,6 +349,10 @@ async function handleChatText(rawValue) {
   }
 
   if (chatStep === 'previous-story-next') {
+    if (shouldContinueToOpenQuestions(value)) {
+      askPreviousStoryOpenQuestions();
+      return;
+    }
     if (isNextStepQuestion(value)) {
       askPreviousStoryNextStep(chatState.selectedStory, 'You can use the saved summary as-is, update it with changes, send it to Lex, or start a new request.');
       return;
@@ -364,6 +378,19 @@ async function handleChatText(rawValue) {
     }
     preparePreviousStoryUpdateForAnalysis();
     addBotMessage('Understood. I will update the previous Ari package with that change.');
+    chatStep = 'summary-revision';
+    chatGenerateBtn.click();
+    return;
+  }
+
+  if (chatStep === 'previous-story-questions') {
+    appendToField('assumptions', `Answers or notes for prior open questions: ${value || `Review attached file(s): ${attachedNames.join(', ')}`}`);
+    if (attachedNames.length) {
+      chatState.hasFiles = true;
+      chatState.attachmentsAcknowledged = true;
+    }
+    preparePreviousStoryUpdateForAnalysis();
+    addBotMessage('Got it. I will fold those answers into the saved Ari package and regenerate the summary.');
     chatStep = 'summary-revision';
     chatGenerateBtn.click();
     return;
@@ -645,17 +672,67 @@ function applyStorySetToChat(story) {
   updateChatConfidence();
 }
 
+async function resumePreviousStory(story) {
+  applyStorySetToChat(story);
+  clearChatChips();
+  setChatBusy(true, 'Ari is re-scanning the saved summary and previous context...');
+  addBotMessage('I am re-scanning the saved Ari summary, user stories, process flow, risks, and open questions so we can pick up where the work stopped.');
+  try {
+    await wait(700);
+    clearChatStatus();
+    addPreviousStoryRecap(story);
+    if (story.status?.state === 'sent_to_lex') {
+      usePreviousStoryAsCurrent();
+      addBotMessage('This package has already been sent to Lex. I can show it again, but I will not change it from here.');
+      chatStep = 'previous-story-readonly';
+      renderChatChips([
+        { label: 'Start new instead', value: 'start-new' }
+      ]);
+      return;
+    }
+    const questions = getPreviousStoryOpenQuestions(story);
+    if (questions.length) {
+      addBotMessage(`I found ${questions.length} open question${questions.length === 1 ? '' : 's'} from the prior summary. I will ask only the ones that still matter for the next version.`);
+      askPreviousStoryOpenQuestions();
+      return;
+    }
+    usePreviousStoryAsCurrent();
+    addBotMessage('I did not find any major open questions in the saved package. The prior summary is loaded; you can update it, send it to Lex, or start a new request.');
+    chatStep = 'previous-story-next';
+    renderChatChips([
+      { label: 'Update it', value: 'previous-update' },
+      { label: 'Send to Lex', value: 'previous-send-lex' },
+      { label: 'Use last summary', value: 'previous-use-as-is' },
+      { label: 'Start new instead', value: 'start-new' }
+    ]);
+  } finally {
+    setChatBusy(false);
+  }
+}
+
 function askPreviousStoryNextStep(story, prompt = '') {
   chatStep = 'previous-story-next';
   chatGenerateBtn.classList.add('hidden');
   addPreviousStoryRecap(story);
   addBotMessage(prompt || 'This one already has a saved Ari package. What would you like to do next?');
+  const hasQuestions = Array.isArray(story?.openQuestions) && story.openQuestions.length > 0;
   renderChatChips([
     { label: 'Use last summary', value: 'previous-use-as-is' },
+    ...(hasQuestions ? [{ label: 'Answer open questions', value: 'previous-answer-questions' }] : []),
     { label: 'Update it', value: 'previous-update' },
     { label: 'Send to Lex', value: 'previous-send-lex' },
     { label: 'Start new instead', value: 'start-new' }
   ]);
+}
+
+function askPreviousStoryOpenQuestions() {
+  const questions = getPreviousStoryOpenQuestions(chatState.selectedStory);
+  chatStep = 'previous-story-questions';
+  if (!questions.length) {
+    askPreviousStoryUpdate();
+    return;
+  }
+  addBotMessage(`Let's close the open questions from the last summary. Answer any you know in one message; it is okay to say "I don't know" for the rest.\n\n${questions.slice(0, 3).map((item, index) => `${index + 1}. ${item}`).join('\n')}`);
 }
 
 function askPreviousStoryUpdate() {
@@ -682,6 +759,12 @@ function usePreviousStoryAsCurrent() {
   renderAnalysis(lastAnalysis, lastSavedStorySet);
   prepareLexForm();
   status('Loaded previous Ari package.', false, true);
+}
+
+function getPreviousStoryOpenQuestions(story) {
+  return (story?.openQuestions || [])
+    .map(item => String(item || '').trim())
+    .filter(Boolean);
 }
 
 function buildAnalysisFromStory(story) {
@@ -727,8 +810,14 @@ function isNextStepQuestion(value) {
   return /\b(what.*next|next step|do next|where.*go|how.*proceed|proceed|continue)\b/i.test(String(value || ''));
 }
 
+function shouldContinueToOpenQuestions(value) {
+  const hasQuestions = Array.isArray(chatState.selectedStory?.openQuestions) && chatState.selectedStory.openQuestions.length > 0;
+  return hasQuestions && /\b(continue|question|questions|open|answer|close|resolve|clarif)/i.test(String(value || ''));
+}
+
 function addPreviousStoryRecap(story) {
   const stories = Array.isArray(story.userStories) ? story.userStories : [];
+  const documents = Array.isArray(story.documents) ? story.documents : [];
   const storyPreview = stories.slice(0, 3).map(item => {
     const role = item.role || 'user';
     const goal = item.goal || 'the requested capability';
@@ -736,8 +825,11 @@ function addPreviousStoryRecap(story) {
     return `As a ${role}, I want ${goal}, so that ${benefit}.`;
   });
   const pieces = [
-    `Last Ari summary for ${story.customerName || 'this customer'} / ${story.projectName || 'this project'}: ${story.summary || 'No summary text was saved.'}`,
+    story.summaryFileUrl
+      ? `Last Ari summary for ${story.customerName || 'this customer'} / ${story.projectName || 'this project'} is saved as a summary file: ${story.summaryFileUrl}`
+      : `Last Ari summary for ${story.customerName || 'this customer'} / ${story.projectName || 'this project'}: ${story.summary || 'No summary text was saved.'}`,
     story.totalMinDays || story.totalMaxDays ? `Prior estimate: ${story.totalMinDays || 0}-${story.totalMaxDays || 0} mandays, ${story.confidence || 'confidence not stated'}.` : '',
+    documents.length ? `Stored source documents: ${documents.slice(0, 3).map(item => item.originalName || item.key).join(', ')}${documents.length > 3 ? `, plus ${documents.length - 3} more` : ''}.` : '',
     story.processFlow?.summary ? `Process flow: ${story.processFlow.summary}` : '',
     storyPreview.length ? `User stories captured: ${storyPreview.join(' ')}` : '',
     Array.isArray(story.openQuestions) && story.openQuestions.length ? `Open questions: ${story.openQuestions.slice(0, 3).join(' ')}` : ''
@@ -1174,6 +1266,7 @@ function inferToolNameFromChat() {
 function buildAnalysisFormData() {
   commitChatStateToForm();
   const body = new FormData(form);
+  body.set('ariConfidence', `${chatConfidence}%`);
   if (chatState.previousStoryUpdate) {
     body.set('previousStoryUpdate', 'true');
     body.set('contractPath', 'details');
@@ -1807,11 +1900,17 @@ function renderSavedStorySet(savedStorySet) {
   const link = savedStorySet.userStoriesUrl
     ? ` <a href="${escapeHtml(savedStorySet.userStoriesUrl)}" target="_blank" rel="noopener">View summary</a>`
     : '';
+  const summaryFileLink = savedStorySet.summaryFileUrl
+    ? ` <a href="${escapeHtml(savedStorySet.summaryFileUrl)}" target="_blank" rel="noopener">Open S3 summary file</a>`
+    : '';
+  const statusText = savedStorySet.status?.label
+    ? ` Status: ${escapeHtml(savedStorySet.status.label)}${savedStorySet.status.confidence ? ` (${escapeHtml(savedStorySet.status.confidence)} confidence)` : ''}.`
+    : '';
   const storyCount = savedStorySet.userStories?.length || 0;
   const label = storyCount
     ? `Saved Ari analysis and ${storyCount} user stories for ${escapeHtml(savedStorySet.customerName)}.`
     : `Saved Ari analysis package for ${escapeHtml(savedStorySet.customerName)}.`;
-  return `<section class="save-notice"><h3>Ari Analysis Save</h3><p>${label}${link}</p></section>`;
+  return `<section class="save-notice"><h3>Ari Analysis Save</h3><p>${label}${statusText}${link}${summaryFileLink}</p></section>`;
 }
 
 function selectedMandays() {
