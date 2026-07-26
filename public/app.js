@@ -146,6 +146,7 @@ function startChat() {
   chatState = {
     contractPath: 'details',
     projectType: 'new-tool',
+    engagementId: '',
     customerName: '',
     requesterName: '',
     businessUnit: '',
@@ -431,6 +432,9 @@ async function handleChatText(rawValue) {
 
 function captureChatValue(value) {
   switch (chatStep) {
+    case 'engagement-id':
+      chatState.engagementId = normalizeOptionalEngagementId(value);
+      break;
     case 'customer':
       chatState.customerName = value;
       break;
@@ -609,6 +613,8 @@ function askNextStepAfterAnswer(step) {
 }
 
 function askNextMissingQuestion() {
+  if (chatState.engagementId === undefined) chatState.engagementId = '';
+  if (!chatState.engagementIdAsked) return askEngagementId();
   if (!chatState.customerName || chatState.customerName === 'Not provided yet') return askCustomer();
   if (!chatState.toolName || chatState.toolName === 'Ari chat intake in progress') return askProjectName();
   if (chatState.projectType === 'extension' && !chatState.existingToolReference) return askExistingToolReference();
@@ -620,6 +626,12 @@ function askNextMissingQuestion() {
   if (!chatState.constraints) return askConstraints();
   if (!chatState.timeline) return askTimelineAssumptions();
   finishChatIntake();
+}
+
+function askEngagementId() {
+  chatStep = 'engagement-id';
+  chatState.engagementIdAsked = true;
+  addBotMessage('Is there an existing Engagement ID for this work? This is the Parent ID that follows the project through Ari, Lex, Milo, delivery, and support. If you are not sure, ask Nova to search first, or say "not sure".');
 }
 
 async function showMyStorySets() {
@@ -866,31 +878,25 @@ function setSourceMaterial(value) {
     chatState.contractPath = 'refine';
     chatState.projectType = 'new-tool';
     addBotMessage('Please upload the draft or supporting document. I will read it first and only ask what remains unclear.');
-    chatStep = 'document-label';
-    if (!chatState.customerName) addBotMessage('While that uploads, who is the customer?');
-    else askDocumentProjectLabel();
+    askNextMissingQuestion();
     return;
   }
   if (value === 'approved') {
     chatState.contractPath = 'approved-upload';
     chatState.projectType = 'new-tool';
     addBotMessage('Please upload the approved contract. I will not change the signed contract; I will read it for metadata, billing milestones, obligations, and next-stage handoff.');
-    chatStep = 'document-label';
-    if (!chatState.customerName) addBotMessage('Who should I label this approved contract under?');
-    else askDocumentProjectLabel();
+    askNextMissingQuestion();
     return;
   }
   if (value === 'extension') {
     chatState.contractPath = 'details';
     chatState.projectType = 'extension';
-    if (!chatState.customerName) askCustomer();
-    else askProjectName();
+    askNextMissingQuestion();
     return;
   }
   chatState.contractPath = 'details';
   chatState.projectType = 'new-tool';
-  if (!chatState.customerName) askCustomer();
-  else askProjectName();
+  askNextMissingQuestion();
 }
 
 function askCustomer() {
@@ -1230,6 +1236,7 @@ function confidenceText(value) {
 function commitChatStateToForm() {
   setRadioValue('contractPath', chatState.contractPath || 'details');
   setRadioValue('projectType', chatState.projectType || 'new-tool');
+  setFormValue('engagementId', chatState.engagementId);
   setFormValue('customerName', chatState.customerName || 'Customer not provided');
   setFormValue('requesterName', chatState.requesterName);
   setFormValue('businessUnit', chatState.businessUnit);
@@ -1245,6 +1252,12 @@ function commitChatStateToForm() {
   setFormValue('assumptions', appendLines(chatState.assumptions, `Ari chat confidence before analysis: ${chatConfidence}%. Ari targets an initial 80% view, not 100% certainty.`));
   syncMode();
   syncContractPath();
+}
+
+function normalizeOptionalEngagementId(value) {
+  const text = String(value || '').trim();
+  if (!text || /^not sure$|^unknown$|^none$|^no$/i.test(text)) return '';
+  return text.replace(/_/g, '-').toUpperCase();
 }
 
 function setFormValue(name, value) {

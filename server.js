@@ -37,8 +37,9 @@ const AUTH_ENABLED = Boolean(MICROSOFT_CLIENT_ID && MICROSOFT_CLIENT_SECRET);
 const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
 const SESSION_COOKIE_SECURE = parseBooleanEnv('SESSION_COOKIE_SECURE', process.env.NODE_ENV === 'production');
 const MONGODB_URI = process.env.MONGODB_URI || '';
-const MONGODB_DB_NAME = process.env.MONGODB_DB_NAME || 'analyst_bot';
+const MONGODB_DB_NAME = process.env.MONGODB_DB_NAME || 'dbsi-contract-agent';
 const MONGODB_STORIES_COLLECTION = process.env.MONGODB_STORIES_COLLECTION || process.env.MONGODB_COLLECTION || 'customer_user_stories';
+const MONGODB_ENGAGEMENTS_COLLECTION = process.env.MONGODB_ENGAGEMENTS_COLLECTION || 'engagement_registry';
 const ORG_SLUG = normalizeOrgSlug(process.env.ORG_SLUG || 'devboxph');
 const S3_BUCKET = String(process.env.ARI_S3_BUCKET || process.env.S3_BUCKET || '').trim();
 const S3_REGION = String(process.env.ARI_S3_REGION || process.env.S3_REGION || process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || '').trim();
@@ -51,6 +52,7 @@ let msalClient;
 let mongoClient;
 let s3Client;
 let storiesIndexesReady = false;
+let engagementRegistryIndexesReady = false;
 const analysisJobs = new Map();
 const clarificationJobs = new Map();
 const ANALYSIS_JOB_TTL_MS = Number(process.env.ANALYSIS_JOB_TTL_MS || 30 * 60 * 1000);
@@ -409,6 +411,7 @@ function normalizeRequest(body) {
   const request = {
     contractPath,
     projectType,
+    engagementId: cleanRegistryId(body.engagementId),
     customerName: clean(body.customerName),
     requesterName: clean(body.requesterName),
     businessUnit: clean(body.businessUnit),
@@ -623,6 +626,8 @@ function buildStructuredLexHandoff(handoff) {
     source: 'ari-analyst-bot',
     handoffMode: handoff.draftingMode,
     generatedAt: new Date().toISOString(),
+    engagementId: handoff.savedStorySet?.engagementId || '',
+    ariStorySetId: handoff.savedStorySet?.id || '',
     customerName: handoff.customerName || handoff.intake.customerName || '',
     projectName: handoff.projectName || handoff.intake.toolName || '',
     requestType: handoff.intake.projectType === 'extension' ? 'Extension of an existing tool' : 'New tool',
@@ -679,6 +684,8 @@ function basicLexHandoff(handoff) {
     source: 'ari-analyst-bot',
     handoffMode: handoff.draftingMode,
     generatedAt: new Date().toISOString(),
+    engagementId: handoff.savedStorySet?.engagementId || '',
+    ariStorySetId: handoff.savedStorySet?.id || '',
     customerName: handoff.customerName || handoff.intake.customerName || '',
     projectName: handoff.projectName || handoff.intake.toolName || '',
     requestType: handoff.intake.projectType === 'extension' ? 'Extension of an existing tool' : 'New tool',
@@ -1548,6 +1555,105 @@ async function getStoriesCollection() {
   return collection;
 }
 
+async function getEngagementRegistryCollection() {
+  if (!MONGODB_URI) {
+    throw Object.assign(new Error('MongoDB is not configured. Add MONGODB_URI to .env to save engagement registry records.'), { status: 503 });
+  }
+  if (!mongoClient) {
+    mongoClient = new MongoClient(MONGODB_URI);
+    await mongoClient.connect();
+  }
+  const collection = mongoClient.db(MONGODB_DB_NAME).collection(MONGODB_ENGAGEMENTS_COLLECTION);
+  if (!engagementRegistryIndexesReady) {
+    await collection.createIndex({ orgSlug: 1, engagementId: 1 }, { unique: true });
+    await collection.createIndex({ orgSlug: 1, ariStorySetId: 1 }, { sparse: true });
+    await collection.createIndex({ orgSlug: 1, contractId: 1 }, { sparse: true });
+    await collection.createIndex({ orgSlug: 1, lexContractId: 1 }, { sparse: true });
+    await collection.createIndex({ orgSlug: 1, updatedAt: -1 });
+    engagementRegistryIndexesReady = true;
+  }
+  return collection;
+}
+
+function createEngagementId(now = new Date()) {
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, '0');
+  return `ENG-${year}${month}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
+}
+
+function cleanRegistryId(value) {
+  const text = clean(value);
+  if (!text || /^not sure$|^unknown$|^none$|^no$/i.test(text)) return '';
+  return text.replace(/_/g, '-').toUpperCase();
+}
+
+async function upsertEngagementRegistryFromStorySet(record) {
+  if (!MONGODB_URI || !record?.engagementId) return;
+  const collection = await getEngagementRegistryCollection();
+  const now = new Date();
+  await collection.updateOne(
+    { orgSlug: ORG_SLUG, engagementId: record.engagementId },
+    {
+      $set: {
+        orgSlug: ORG_SLUG,
+        engagementId: record.engagementId,
+        ariStorySetId: record.id,
+        customerName: record.customerName || '',
+        customerKey: record.customerKey || normalizeKey(record.customerName),
+        projectName: record.projectName || '',
+        requesterName: record.requesterName || '',
+        createdBy: record.createdByEmail || record.createdByName || '',
+        createdByEmail: record.createdByEmail || '',
+        createdByName: record.createdByName || '',
+        participants: [record.createdByEmail || record.createdByName].filter(Boolean),
+        status: record.status?.state || 'summary_generated',
+        currentOwnerBot: 'Ari',
+        ariUserStoriesUrl: storySetUrl(record.id),
+        updatedAt: now,
+        timestamps: {
+          ariStoryCreatedAt: record.createdAt || now,
+          ariStoryUpdatedAt: record.updatedAt || now,
+          registryUpdatedAt: now
+        }
+      },
+      $setOnInsert: {
+        createdAt: record.createdAt || now
+      }
+    },
+    { upsert: true }
+  );
+}
+
+async function updateEngagementRegistryForLexHandoff(storySetId, lexPayload) {
+  if (!MONGODB_URI || !storySetId) return;
+  const storySet = await getStorySetById(storySetId);
+  if (!storySet?.engagementId) return;
+  const collection = await getEngagementRegistryCollection();
+  const now = new Date();
+  const contractId = clean(lexPayload?.engagement?.contractId || lexPayload?.contractId || '');
+  const lexContractId = clean(lexPayload?.engagement?.lexContractId || lexPayload?.lexContractId || contractId);
+  const lexJobId = clean(lexPayload?.job?.id || '');
+  await collection.updateOne(
+    { orgSlug: ORG_SLUG, engagementId: storySet.engagementId },
+    {
+      $set: {
+        ariStorySetId: storySet.id,
+        customerName: storySet.customerName || '',
+        projectName: storySet.projectName || '',
+        ...(contractId ? { contractId } : {}),
+        ...(lexContractId ? { lexContractId } : {}),
+        ...(lexJobId ? { lexJobId } : {}),
+        status: contractId ? 'contract_created' : 'sent_to_lex',
+        currentOwnerBot: 'Lex',
+        updatedAt: now,
+        'timestamps.lexHandoffAt': now,
+        'timestamps.registryUpdatedAt': now
+      }
+    },
+    { upsert: false }
+  );
+}
+
 async function saveCustomerUserStories(request, analysis, user, documents = []) {
   const contractPath = request.contractPath || 'details';
   const userStories = normalizeUserStories(analysis.draftedUserStories);
@@ -1564,8 +1670,10 @@ async function saveCustomerUserStories(request, analysis, user, documents = []) 
   const createdByEmail = String(user?.email || '').trim().toLowerCase();
   const createdByName = clean(user?.name || createdByEmail || 'Ari user');
   const id = randomId();
+  const engagementId = createEngagementId(now);
   const record = {
     id,
+    engagementId: request.engagementId || engagementId,
     orgSlug: ORG_SLUG,
     createdByEmail,
     createdByName,
@@ -1624,6 +1732,7 @@ async function saveCustomerUserStories(request, analysis, user, documents = []) 
 
   const collection = await getStoriesCollection();
   await collection.insertOne(record);
+  await upsertEngagementRegistryFromStorySet(record);
   return clientStorySet(record);
 }
 
@@ -1662,6 +1771,7 @@ async function markStorySetSentToLex(storySetId, lexPayload) {
       $push: { statusHistory: status }
     }
   );
+  await updateEngagementRegistryForLexHandoff(id, lexPayload);
 }
 
 function normalizeUserStories(stories) {
@@ -1736,6 +1846,7 @@ function clientStorySet(record) {
   return {
     saved: true,
     id: record.id,
+    engagementId: record.engagementId || '',
     orgSlug: record.orgSlug || ORG_SLUG,
     userStoriesUrl: storySetUrl(record.id),
     customerName: record.customerName,
