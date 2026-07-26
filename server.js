@@ -60,10 +60,13 @@ const upload = multer({
       'text/csv',
       'application/csv',
       'application/json',
+      'image/png',
+      'image/jpeg',
+      'image/webp',
       'application/octet-stream'
     ]);
     if (!allowed.has(file.mimetype)) {
-      return cb(Object.assign(new Error('Upload PDF, DOCX, TXT, HTML, MD, CSV, or JSON files.'), { status: 400 }));
+      return cb(Object.assign(new Error('Upload PDF, DOCX, TXT, HTML, MD, CSV, JSON, PNG, JPG, or WEBP files.'), { status: 400 }));
     }
     cb(null, true);
   }
@@ -222,6 +225,27 @@ app.get('/api/customers/:customerName/user-stories', async (req, res, next) => {
   } catch (error) { next(error); }
 });
 
+app.get('/api/my-user-stories', async (req, res, next) => {
+  try {
+    if (!MONGODB_URI) {
+      res.json({ success: true, stories: [], storageConfigured: false });
+      return;
+    }
+    const email = String(req.session.user?.email || '').trim().toLowerCase();
+    if (!email) {
+      res.json({ success: true, stories: [], storageConfigured: true, reason: 'Sign in to see stories created under your email.' });
+      return;
+    }
+    const collection = await getStoriesCollection();
+    const stories = await collection
+      .find({ orgSlug: ORG_SLUG, createdByEmail: email })
+      .sort({ createdAt: -1 })
+      .limit(12)
+      .toArray();
+    res.json({ success: true, stories: stories.map(clientStorySet), storageConfigured: true });
+  } catch (error) { next(error); }
+});
+
 app.post('/api/customer-user-stories', async (req, res, next) => {
   try {
     const customerName = clean(req.body.customerName);
@@ -348,7 +372,8 @@ app.get('/api/lex-jobs/:jobId', async (req, res, next) => {
 
 function normalizeRequest(body) {
   const contractPath = normalizeLexDraftingMode(body.contractPath);
-  const projectType = String(body.projectType || '').trim();
+  const chatPartial = String(body.chatPartial || '').toLowerCase() === 'true';
+  const projectType = String(body.projectType || '').trim() || (chatPartial ? 'new-tool' : '');
   if (!['new-tool', 'extension'].includes(projectType)) {
     throw Object.assign(new Error('Choose whether this is a new tool or an extension of an existing tool.'), { status: 400 });
   }
@@ -371,6 +396,12 @@ function normalizeRequest(body) {
     assumptions: clean(body.assumptions),
     clarificationAnswers: normalizeClarificationAnswers(body.clarificationAnswers)
   };
+
+  if (chatPartial) {
+    request.customerName ||= 'Not provided yet';
+    request.toolName ||= 'Ari chat intake in progress';
+    return request;
+  }
 
   if (!request.customerName) throw Object.assign(new Error('Add the customer name.'), { status: 400 });
   if (!request.toolName && contractPath === 'details') throw Object.assign(new Error('Add a tool or project name.'), { status: 400 });
@@ -765,14 +796,22 @@ function asList(value) {
 async function extractUploadedFiles(files) {
   const extracted = [];
   for (const file of files) {
-    const text = await extractText(file);
+    const image = await extractImageData(file);
+    const text = image ? '' : await extractText(file);
     extracted.push({
       originalName: file.originalname,
       mimeType: file.mimetype,
-      text: text.slice(0, MAX_CONTEXT_CHARS)
+      text: text.slice(0, MAX_CONTEXT_CHARS),
+      imageDataUrl: image
     });
   }
   return extracted;
+}
+
+async function extractImageData(file) {
+  if (!isImageFile(file)) return '';
+  const buffer = await fs.readFile(file.path);
+  return `data:${file.mimetype};base64,${buffer.toString('base64')}`;
 }
 
 async function extractText(file) {
@@ -786,6 +825,12 @@ async function extractText(file) {
     return parsed.value || '';
   }
   return buffer.toString('utf8');
+}
+
+function isImageFile(file) {
+  const name = String(file.originalname || '').toLowerCase();
+  return ['image/png', 'image/jpeg', 'image/webp'].includes(file.mimetype)
+    || /\.(png|jpe?g|webp)$/.test(name);
 }
 
 async function cleanupFiles(files) {
@@ -807,13 +852,15 @@ async function createTechnicalAnalysis(request, files) {
           'You are Devbox Analyst, a senior business analyst and technical solution architect.',
           'The delivery stack is MEAN and Ionic: MongoDB, Express, Angular, Node.js, and Ionic mobile/web where relevant.',
           'When files are uploaded, treat them as primary source material. Read them meticulously and extract concrete facts before interpreting, estimating, or summarizing.',
+          'When images or diagrams are uploaded, inspect them directly and use visible labels, actors, systems, arrows, statuses, approvals, and handoffs when building questions, process flow, scope, risks, and estimates.',
           'Users may write in non-technical business language. Translate intent into clear technical scope without shaming or overcomplicating.',
           'Estimate in mandays using realistic delivery activities: discovery, UX/UI, Angular/Ionic frontend, Express/Node API, MongoDB/data model, integrations, QA, UAT support, deployment, project management, and contingency.',
+          'Use Devbox calibration anchors: a simple one-page static website with supplied copy/assets and no integrations is about 1 manday end to end. Do not inflate small static or informational work. Increase estimates only for real added complexity such as CMS/admin editing, forms, authentication, integrations, responsive custom design, analytics, deployment hardening, content creation, approvals, or data migration.',
           'For extensions, account for repository/documentation review, existing architecture constraints, regression testing, migration, and backwards compatibility.',
           'Return only valid JSON matching the requested schema. Do not wrap it in markdown.'
         ].join(' ')
       },
-      { role: 'user', content: prompt }
+      { role: 'user', content: buildOpenAIUserContent(prompt, files) }
     ],
     text: {
       format: {
@@ -886,6 +933,18 @@ function pruneAnalysisJobs() {
   }
 }
 
+function buildOpenAIUserContent(prompt, files) {
+  const content = [{ type: 'input_text', text: prompt }];
+  for (const file of files) {
+    if (!file.imageDataUrl) continue;
+    content.push({
+      type: 'input_image',
+      image_url: file.imageDataUrl
+    });
+  }
+  return content;
+}
+
 async function createClarifyingQuestions(request, files) {
   if (!hasUsableOpenAIKey()) {
     throw Object.assign(new Error('OPENAI_API_KEY is not configured. Add it to .env before asking Ari for clarifying questions.'), { status: 500 });
@@ -899,13 +958,13 @@ async function createClarifyingQuestions(request, files) {
         content: [
           'You are Ari, Devbox\'s analyst bot.',
           'Ask only the few questions that would materially sharpen Ari\'s analysis of the request or uploaded document.',
-          'When files are uploaded, read the document content carefully before asking. Avoid questions that are already answered or reasonably inferable from the file.',
+          'When files are uploaded, read document content and inspect diagrams carefully before asking. Avoid questions that are already answered or reasonably inferable from the file or image.',
           'When an uploaded document has unclear workflow, billing, delivery obligations, milestones, handoffs, statuses, forms, dashboards, operations, or multiple user roles, prioritize one simple question about that gap.',
           'The audience is business users. Use simple language, avoid jargon, and make it okay if they do not know.',
           'Return at most 3 questions. Do not ask questions already clearly answered by the intake.'
         ].join(' ')
       },
-      { role: 'user', content: buildClarifyingQuestionPrompt(request, files) }
+      { role: 'user', content: buildOpenAIUserContent(buildClarifyingQuestionPrompt(request, files), files) }
     ],
     text: {
       format: {
@@ -978,7 +1037,7 @@ function pruneClarificationJobs() {
 function buildClarifyingQuestionPrompt(request, files) {
   const fileNames = files.length ? files.map(file => file.originalName).join(', ') : 'No files uploaded';
   const fileContext = files.length
-    ? files.map(file => `FILE: ${file.originalName}\nCONTENT:\n${file.text.slice(0, QUESTION_FILE_CONTEXT_CHARS) || '(No readable text extracted.)'}`).join('\n\n---\n\n')
+    ? files.map(file => `FILE: ${file.originalName}\nTYPE: ${file.mimeType}\nCONTENT:\n${file.imageDataUrl ? '(Image/diagram attached as visual input. Inspect it directly for workflow, labels, actors, statuses, systems, and handoffs.)' : (file.text.slice(0, QUESTION_FILE_CONTEXT_CHARS) || '(No readable text extracted.)')}`).join('\n\n---\n\n')
     : '(No files uploaded.)';
   return `Create a short list of clarifying questions before Ari analyzes this request.
 
@@ -1002,6 +1061,7 @@ ${fileContext}
 Rules:
 - Ask 0 to 3 questions only.
 - If a file is uploaded, read it meticulously first. The user has already done work in that document and will be frustrated by shallow or duplicate questions.
+- If the assumptions include a "Recent chat answer", use that as the immediate conversation context. Pivot to the most relevant next question from that answer instead of following a generic intake template.
 - Ask a question only when the missing answer would materially change Ari's analysis, estimate, billing metadata, operational handoff, or risk assessment.
 - For uploaded drafts or approved contracts, base questions on the file content. Do not ask the user to re-enter business problem, desired outcome, user stories, feature lists, data needs, or other details already visible in the file.
 - For "Refine uploaded draft", ask about document substance only when unclear: intended scope changes, missing appendices, unclear commercials, acceptance milestones, obligations, exclusions, dependencies, implementation flow, or support handoff. Do not ask about how to get the file to Lex.
@@ -1015,7 +1075,7 @@ Rules:
 
 function buildPrompt(request, files) {
   const fileContext = files.length
-    ? files.map(file => `FILE: ${file.originalName}\nMIME: ${file.mimeType}\nCONTENT:\n${file.text || '(No readable text extracted.)'}`).join('\n\n---\n\n')
+    ? files.map(file => `FILE: ${file.originalName}\nTYPE: ${file.mimeType}\nCONTENT:\n${file.imageDataUrl ? '(Image/diagram attached as visual input. Inspect it directly for workflow, labels, actors, statuses, systems, and handoffs.)' : (file.text || '(No readable text extracted.)')}`).join('\n\n---\n\n')
     : '(No files uploaded.)';
 
   return `Analyze this request and produce a business-friendly technical analysis with manday estimates.
@@ -1059,12 +1119,14 @@ ${fileContext}
 
 Guidance:
 - Uploaded files are primary evidence. Before producing the analysis, extract and rely on concrete document facts: parties, project names, scope sections, appendices, deliverables, fees, recurring charges, payment triggers, milestones, dates, dependencies, responsibilities, exclusions, acceptance criteria, renewal/termination language, integrations, reports, dashboards, operational handoffs, and support obligations where present.
+- Uploaded diagrams and screenshots are also primary evidence. Inspect visible labels, actors, systems, arrows, statuses, approvals, and handoffs, then reflect them in processFlow, scope, risks, and estimates.
 - Do not skim uploaded files or replace them with generic assumptions. If a document mentions a specific amount, milestone, appendix, date, role, platform, report, or obligation, reflect it in the analysis unless it is irrelevant.
 - Distinguish clearly between facts found in the uploaded file and Ari's assumptions or inferences.
 - If the uploaded text appears incomplete, truncated, scanned, or unreadable, say so in assumptions/openQuestions and explain what analysis may be affected.
 - If language is vague, infer likely technical work and label those items as assumptions.
 - Treat "I don't know" clarification answers as uncertainty, not as missing user effort. Add reasonable contingency and list the uncertainty plainly.
 - Use MEAN/Ionic terminology in the technical sections, but keep summaries clear enough for business stakeholders.
+- Devbox sizing calibration: a simple one-page static website with supplied copy/assets, no backend, no forms, no CMS, no authentication, no integrations, and ordinary deployment is about 1 manday total. A slightly polished responsive one-pager may be 1-2 mandays. Only add more when scope truly includes custom design rounds, content writing, multiple pages, CMS/admin editing, forms, analytics, hosting/DNS/SSL setup, integrations, approvals, QA breadth, or other concrete complexity.
 - Break estimates into small work packages with minDays, maxDays, and confidence.
 - totalMinDays and totalMaxDays must equal the sum of the work package minDays and maxDays.
 - Include open questions that would materially change scope or estimate.
@@ -1342,6 +1404,7 @@ async function getStoriesCollection() {
   const collection = mongoClient.db(MONGODB_DB_NAME).collection(MONGODB_STORIES_COLLECTION);
   if (!storiesIndexesReady) {
     await collection.createIndex({ orgSlug: 1, customerKey: 1, createdAt: -1 });
+    await collection.createIndex({ orgSlug: 1, createdByEmail: 1, createdAt: -1 });
     await collection.createIndex({ orgSlug: 1, id: 1 }, { unique: true });
     storiesIndexesReady = true;
   }
@@ -1361,9 +1424,13 @@ async function saveCustomerUserStories(request, analysis, user) {
   }
 
   const now = new Date();
+  const createdByEmail = String(user?.email || '').trim().toLowerCase();
+  const createdByName = clean(user?.name || createdByEmail || 'Ari user');
   const record = {
     id: randomId(),
     orgSlug: ORG_SLUG,
+    createdByEmail,
+    createdByName,
     customerName: request.customerName,
     customerKey: normalizeKey(request.customerName),
     projectName: request.toolName || inferProjectNameFromAnalysis(analysis) || `${contractPath} analysis`,
@@ -1389,7 +1456,7 @@ async function saveCustomerUserStories(request, analysis, user) {
     source: {
       toolName: request.toolName,
       keyFeatures: request.keyFeatures || '',
-      createdBy: user?.email || user?.name || 'Ari user'
+      createdBy: createdByEmail || createdByName
     },
     createdAt: now,
     updatedAt: now
@@ -1442,6 +1509,8 @@ function clientStorySet(record) {
     assumptions: record.assumptions || [],
     openQuestions: record.openQuestions || [],
     recommendation: record.recommendation || '',
+    createdByEmail: record.createdByEmail || '',
+    createdByName: record.createdByName || '',
     createdBy: record.source?.createdBy || '',
     createdAt: record.createdAt
   };

@@ -2,10 +2,12 @@
 
 **Ari** turns plain-language business requests into a technical analysis and manday estimate for the Devbox MEAN/Ionic stack.
 
-It supports two intake paths:
+The primary experience is chat-led. Ari first asks whether the user wants to continue prior user stories created under their signed-in email or start something new, then asks what source material to use:
 
-1. **New tool** - for applications or workflows built from scratch.
-2. **Extension** - for enhancements to an existing tool. This path asks for a repository link, documentation link, or short description of the existing system before analysis.
+- **Start from scratch** - for applications or workflows built from a business idea.
+- **Draft or supporting documents** - Ari reads the file before asking what remains unclear.
+- **Approved contract** - Ari reads for metadata, billing milestones, obligations, and next-stage handoff without changing the signed contract.
+- **Existing tool or repository** - Ari asks for repository/documentation context and estimates the extension work.
 
 The bot is designed for business stakeholders, so users can describe the request in everyday language. The AI response translates that into:
 
@@ -20,7 +22,9 @@ The bot is designed for business stakeholders, so users can describe the request
 - practical delivery recommendation
 - Lex-ready contract handoff with computed commercial totals
 
-Before estimating, Ari may ask up to three simple clarifying questions. If the request involves a workflow, approvals, handoffs, statuses, or multiple roles, Ari prioritizes asking about the process flow. Users can answer only what they know or choose "I don't know"; Ari treats unknown answers as estimate uncertainty instead of blocking the workflow.
+Ari asks one business-friendly question at a time and shows a confidence rating after each answer. The goal is a useful **80% confidence** view, not perfect certainty; users can generate the Ari summary once they are comfortable with the confidence level.
+
+Ari is calibrated to Devbox sizing norms. As an anchor, a simple one-page static website with supplied copy/assets and no backend, forms, CMS, authentication, or integrations is about **1 manday**. Ari should scale upward only for concrete added complexity such as custom design rounds, multi-page content, CMS/admin editing, integrations, hosting/DNS/SSL work, analytics, broader QA, or approvals.
 
 ## Run
 
@@ -81,9 +85,9 @@ The intake form asks for:
 - constraints, risks, policies, or timeline
 - optional supporting files
 
-Supported uploads: PDF, DOCX, TXT, HTML, Markdown, CSV, and JSON.
+Supported uploads: PDF, DOCX, TXT, HTML, Markdown, CSV, JSON, PNG, JPG, and WEBP.
 
-When a file is uploaded, Ari treats it as primary source material. Ari reads the document before asking clarifying questions and should only ask about items that are missing, unclear, or materially change the analysis.
+When a file is uploaded, Ari treats it as primary source material. Ari reads documents and inspects diagrams before asking clarifying questions, then should only ask about items that are missing, unclear, or materially change the analysis.
 
 Long-running document reading, clarifying questions, and analysis run as background jobs. The browser starts the job and polls Ari until the result is ready, so large document analysis is less likely to fail because of a gateway request timeout.
 

@@ -14,7 +14,7 @@
     </div>
     <div class="header-tools">
       <div id="healthBadge" class="health-badge">Checking AI setup...</div>
-      <div class="ari-badge"><img src="/assets/ari-mascot.png" alt="Ari"><span>Ari</span></div>
+      <div class="ari-badge"><img src="/assets/ari-avatar.png" alt="Ari"><span>Ari</span></div>
     </div>
   </header>
 
@@ -22,10 +22,34 @@
     <section class="intro">
       <h1>Ari technical analysis and manday estimator</h1>
       <p>Ari captures a business request in plain language and turns it into MEAN/Ionic scope, risks, questions, delivery effort, and a Lex-ready contract handoff.</p>
+      <p class="expectation-note">This usually takes around 10 minutes. Ari aims for a useful 80% confidence view at this stage, then the project team can go deeper later. If you want to grab coffee while Ari reads a document, go ahead.</p>
     </section>
 
     <section class="layout">
       <form id="analysisForm" class="panel">
+        <section class="chat-shell" aria-label="Ari interview">
+          <div id="chatMessages" class="chat-messages"></div>
+          <div id="chatChips" class="chat-chips"></div>
+          <div id="chatStatusLine" class="chat-status-line hidden"></div>
+          <input id="chatSupportingFiles" class="chat-file-input" type="file" multiple accept=".pdf,.docx,.txt,.html,.md,.csv,.json,.png,.jpg,.jpeg,.webp">
+          <div id="chatAttachmentList" class="chat-attachment-list hidden"></div>
+          <div class="chat-composer">
+            <button id="chatAttachBtn" class="attach-button" type="button" aria-label="Attach supporting documents or diagrams" title="Attach supporting documents or diagrams">+</button>
+            <textarea id="chatInput" rows="2" placeholder="Type your answer in plain language..."></textarea>
+            <button id="chatSendBtn" type="button">Send</button>
+          </div>
+          <div class="chat-actions">
+            <button id="chatGenerateBtn" class="hidden" type="button">Generate Ari summary</button>
+            <button id="chatResetBtn" class="secondary" type="button">Start over</button>
+          </div>
+          <div class="confidence-meter">
+            <div class="confidence-head"><span>Ari confidence</span><strong id="chatConfidenceLabel">0%</strong></div>
+            <div class="confidence-track"><div id="chatConfidenceBar"></div></div>
+            <p id="chatConfidenceText">Ari will aim for a useful 80% view, not perfect certainty.</p>
+          </div>
+        </section>
+
+        <div class="legacy-intake" aria-hidden="true">
         <div class="mode-row ari-contract-mode-row" role="radiogroup" aria-label="Contract path">
           <label class="mode active">
             <input type="radio" name="contractPath" value="details" checked>
@@ -103,7 +127,8 @@
         <div class="grid">
           <label class="requirements-field">Target timeline<input name="timeline" placeholder="Needed before Q4 planning"></label>
           <label class="requirements-field">Assumptions to include<input name="assumptions" placeholder="Reuse current login, use existing database, etc."></label>
-          <label id="supportingFilesLabel">Supporting files<input name="supportingFiles" type="file" multiple accept=".pdf,.docx,.txt,.html,.md,.csv,.json"></label>
+          <label id="supportingFilesLabel">Supporting files<input name="supportingFiles" type="file" multiple accept=".pdf,.docx,.txt,.html,.md,.csv,.json,.png,.jpg,.jpeg,.webp"></label>
+        </div>
         </div>
 
         <section id="questionsPanel" class="questions-panel hidden">
