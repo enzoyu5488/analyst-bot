@@ -879,8 +879,12 @@ function isNoneAnswer(value) {
   return /^none$|^default$|not sure|unknown|n\/a/i.test(String(value || '').trim());
 }
 
+function isAffirmativeAnswer(value) {
+  return /^(yes|yep|yeah|ok|okay|correct|use default|default|that's fine|that is fine)$/i.test(String(value || '').trim());
+}
+
 function applySupplierAnswer(value) {
-  if (isNoneAnswer(value) || /use default/i.test(value)) return;
+  if (isNoneAnswer(value) || isAffirmativeAnswer(value) || /use default/i.test(value)) return;
   const parts = value.split(/,| - |\n/).map(part => part.trim()).filter(Boolean);
   if (parts[0]) supplierEntity.value = parts[0];
   if (parts[1]) signatoryName.value = parts[1];
@@ -1355,7 +1359,7 @@ function resetClarificationStep() {
 }
 
 form.addEventListener('input', event => {
-  if (event.target.closest('#questionsPanel') || event.target.closest('#lexForm')) return;
+  if (event.target.closest('.chat-shell') || event.target.closest('#questionsPanel') || event.target.closest('#lexForm')) return;
   resetClarificationStep();
 });
 

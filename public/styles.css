@@ -124,7 +124,6 @@ main {
 }
 
 .intro p {
-  max-width: 820px;
   margin: 0;
   color: var(--muted);
   line-height: 1.5;
@@ -132,7 +131,6 @@ main {
 
 .intro .expectation-note {
   margin-top: 10px;
-  max-width: 920px;
   padding: 10px 12px;
   border: 1px solid #c7ece8;
   border-left: 4px solid var(--teal);
