@@ -1509,6 +1509,7 @@ function clientStorySet(record) {
     assumptions: record.assumptions || [],
     openQuestions: record.openQuestions || [],
     recommendation: record.recommendation || '',
+    analysisSnapshot: record.analysisSnapshot || null,
     createdByEmail: record.createdByEmail || '',
     createdByName: record.createdByName || '',
     createdBy: record.source?.createdBy || '',

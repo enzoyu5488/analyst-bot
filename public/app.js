@@ -258,9 +258,30 @@ async function handleChatChoice(value, label) {
     const story = (chatState.availableStories || []).find(item => item.id === value);
     if (story) {
       applyStorySetToChat(story);
-      askSourceMaterial();
+      askPreviousStoryNextStep(story);
     }
     return;
+  }
+
+  if (chatStep === 'previous-story-next') {
+    if (value === 'previous-use-as-is') {
+      usePreviousStoryAsCurrent();
+      askSummaryReview();
+      return;
+    }
+    if (value === 'previous-update') {
+      askPreviousStoryUpdate();
+      return;
+    }
+    if (value === 'previous-send-lex') {
+      usePreviousStoryAsCurrent();
+      await startLexHandoffChat();
+      return;
+    }
+    if (value === 'start-new') {
+      askSourceMaterial();
+      return;
+    }
   }
 
   if (value === 'generate-now') {
@@ -314,6 +335,31 @@ async function handleChatText(rawValue) {
 
   if (chatStep === 'source') {
     handleSourceFreeText(value);
+    return;
+  }
+
+  if (chatStep === 'previous-story-next') {
+    if (isPreviousStoryQuestion(value) && chatState.selectedStory) {
+      addPreviousStoryRecap(chatState.selectedStory);
+      askPreviousStoryNextStep(chatState.selectedStory, 'What would you like to do with that saved Ari package?');
+      return;
+    }
+    appendToField('assumptions', `Continuation note from user: ${value}`);
+    addBotMessage('Got it. I will treat that as an update to the previous Ari package and regenerate the summary.');
+    chatStep = 'summary-revision';
+    chatGenerateBtn.click();
+    return;
+  }
+
+  if (chatStep === 'previous-story-update') {
+    appendToField('assumptions', `Update to previous Ari package: ${value || `Review attached file(s): ${attachedNames.join(', ')}`}`);
+    if (attachedNames.length) {
+      chatState.hasFiles = true;
+      chatState.attachmentsAcknowledged = true;
+    }
+    addBotMessage('Understood. I will update the previous Ari package with that change.');
+    chatStep = 'summary-revision';
+    chatGenerateBtn.click();
     return;
   }
 
@@ -576,6 +622,9 @@ async function showMyStorySets() {
 
 function applyStorySetToChat(story) {
   chatState.selectedStory = story;
+  chatState.sourceMaterial = 'previous-story';
+  chatState.contractPath = story.contractPath || 'details';
+  chatState.projectType = story.projectType || 'new-tool';
   chatState.customerName = story.customerName || '';
   chatState.toolName = story.projectName || '';
   chatState.businessProblem = story.summary || '';
@@ -590,22 +639,65 @@ function applyStorySetToChat(story) {
   updateChatConfidence();
 }
 
+function askPreviousStoryNextStep(story, prompt = '') {
+  chatStep = 'previous-story-next';
+  chatGenerateBtn.classList.add('hidden');
+  addPreviousStoryRecap(story);
+  addBotMessage(prompt || 'This one already has a saved Ari package. What would you like to do next?');
+  renderChatChips([
+    { label: 'Use last summary', value: 'previous-use-as-is' },
+    { label: 'Update it', value: 'previous-update' },
+    { label: 'Send to Lex', value: 'previous-send-lex' },
+    { label: 'Start new instead', value: 'start-new' }
+  ]);
+}
+
+function askPreviousStoryUpdate() {
+  chatStep = 'previous-story-update';
+  addBotMessage('What changed since the last Ari summary? You can type it in plain language or attach an updated document/diagram.');
+}
+
+function usePreviousStoryAsCurrent() {
+  const story = chatState.selectedStory;
+  if (!story) return;
+  lastAnalysis = story.analysisSnapshot || buildAnalysisFromStory(story);
+  lastSavedStorySet = story;
+  commitChatStateToForm();
+  lastIntake = readIntake();
+  renderAnalysis(lastAnalysis, lastSavedStorySet);
+  prepareLexForm();
+  status('Loaded previous Ari package.', false, true);
+}
+
+function buildAnalysisFromStory(story) {
+  return {
+    projectClassification: story.projectType || 'Previous Ari package',
+    totalMinDays: story.totalMinDays || 0,
+    totalMaxDays: story.totalMaxDays || 0,
+    executiveSummary: story.summary || '',
+    confidence: story.confidence || 'saved',
+    interpretedScope: story.summary ? [story.summary] : [],
+    technicalApproach: [],
+    processFlow: story.processFlow || { title: 'Process Flow', summary: '', steps: [] },
+    draftedUserStories: story.userStories || [],
+    meanIonicFit: { frontend: '', backend: '', database: '', mobile: '' },
+    workPackages: story.workPackages || [],
+    assumptions: story.assumptions || [],
+    risks: story.risks || [],
+    openQuestions: story.openQuestions || [],
+    recommendation: story.recommendation || ''
+  };
+}
+
 function handleSourceFreeText(value) {
   if (isPreviousStoryQuestion(value) && chatState.selectedStory) {
     addPreviousStoryRecap(chatState.selectedStory);
-    addBotMessage('You can choose what to base the next step on below, or tell me what changed since that last summary.');
-    askSourceMaterial();
+    askPreviousStoryNextStep(chatState.selectedStory, 'What would you like to do with that saved Ari package?');
     return;
   }
   if (chatState.selectedStory) {
     appendToField('assumptions', `Continuation note from user: ${value}`);
-    addBotMessage('Got it. I will carry that forward with the previous story context. What should I base the next step on?');
-    renderChatChips([
-      { label: 'Start from scratch', value: 'scratch' },
-      { label: 'Draft or supporting docs', value: 'draft' },
-      { label: 'Approved contract to read', value: 'approved' },
-      { label: 'Existing tool or repository', value: 'extension' }
-    ]);
+    askPreviousStoryNextStep(chatState.selectedStory, 'Got it. I will carry that forward with the previous story context. What would you like to do next?');
     return;
   }
   addBotMessage('Please choose one of the options below so I know whether this is from scratch, from documents, an approved contract, or an existing tool.');
