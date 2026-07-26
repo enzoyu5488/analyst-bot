@@ -646,6 +646,7 @@ function inferUsersFromStory(story) {
 
 function askSourceMaterial() {
   chatStep = 'source';
+  chatGenerateBtn.classList.add('hidden');
   addBotMessage('What should I base this on?');
   renderChatChips([
     { label: 'Start from scratch', value: 'scratch' },
@@ -997,9 +998,6 @@ function updateChatConfidence() {
   chatConfidenceLabel.textContent = `${chatConfidence}%`;
   chatConfidenceBar.style.width = `${chatConfidence}%`;
   chatConfidenceText.textContent = confidenceText(chatConfidence);
-  if (chatConfidence >= 65 && chatStep !== 'start' && chatStep !== 'source') {
-    chatGenerateBtn.classList.remove('hidden');
-  }
 }
 
 function calculateChatConfidence() {
