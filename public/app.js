@@ -345,6 +345,7 @@ async function handleChatText(rawValue) {
       return;
     }
     appendToField('assumptions', `Continuation note from user: ${value}`);
+    preparePreviousStoryUpdateForAnalysis();
     addBotMessage('Got it. I will treat that as an update to the previous Ari package and regenerate the summary.');
     chatStep = 'summary-revision';
     chatGenerateBtn.click();
@@ -357,6 +358,7 @@ async function handleChatText(rawValue) {
       chatState.hasFiles = true;
       chatState.attachmentsAcknowledged = true;
     }
+    preparePreviousStoryUpdateForAnalysis();
     addBotMessage('Understood. I will update the previous Ari package with that change.');
     chatStep = 'summary-revision';
     chatGenerateBtn.click();
@@ -655,6 +657,14 @@ function askPreviousStoryNextStep(story, prompt = '') {
 function askPreviousStoryUpdate() {
   chatStep = 'previous-story-update';
   addBotMessage('What changed since the last Ari summary? You can type it in plain language or attach an updated document/diagram.');
+}
+
+function preparePreviousStoryUpdateForAnalysis() {
+  const previousPath = chatState.contractPath || 'details';
+  chatState.sourceMaterial = 'previous-story-update';
+  chatState.contractPath = 'details';
+  chatState.projectType = chatState.projectType || 'new-tool';
+  appendToField('assumptions', `Previous saved Ari package came from contract path "${previousPath}". This update should refresh Ari's analysis from saved context and new user inputs; do not require the original draft/supporting file unless the user attaches one now.`);
 }
 
 function usePreviousStoryAsCurrent() {
