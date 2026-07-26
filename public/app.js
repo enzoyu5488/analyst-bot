@@ -339,6 +339,10 @@ async function handleChatText(rawValue) {
   }
 
   if (chatStep === 'previous-story-next') {
+    if (isNextStepQuestion(value)) {
+      askPreviousStoryNextStep(chatState.selectedStory, 'You can use the saved summary as-is, update it with changes, send it to Lex, or start a new request.');
+      return;
+    }
     if (isPreviousStoryQuestion(value) && chatState.selectedStory) {
       addPreviousStoryRecap(chatState.selectedStory);
       askPreviousStoryNextStep(chatState.selectedStory, 'What would you like to do with that saved Ari package?');
@@ -661,6 +665,7 @@ function askPreviousStoryUpdate() {
 
 function preparePreviousStoryUpdateForAnalysis() {
   const previousPath = chatState.contractPath || 'details';
+  chatState.previousStoryUpdate = true;
   chatState.sourceMaterial = 'previous-story-update';
   chatState.contractPath = 'details';
   chatState.projectType = chatState.projectType || 'new-tool';
@@ -716,6 +721,10 @@ function handleSourceFreeText(value) {
 
 function isPreviousStoryQuestion(value) {
   return /\b(last|previous|prior|recap|summary|where.*left|what.*had|what.*generated|what.*story|what.*done)\b/i.test(String(value || ''));
+}
+
+function isNextStepQuestion(value) {
+  return /\b(what.*next|next step|do next|where.*go|how.*proceed|proceed|continue)\b/i.test(String(value || ''));
 }
 
 function addPreviousStoryRecap(story) {
@@ -1165,6 +1174,10 @@ function inferToolNameFromChat() {
 function buildAnalysisFormData() {
   commitChatStateToForm();
   const body = new FormData(form);
+  if (chatState.previousStoryUpdate) {
+    body.set('previousStoryUpdate', 'true');
+    body.set('contractPath', 'details');
+  }
   if (chatSupportingFiles?.files?.length) {
     body.delete('supportingFiles');
     Array.from(chatSupportingFiles.files).forEach(file => {

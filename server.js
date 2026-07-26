@@ -373,6 +373,7 @@ app.get('/api/lex-jobs/:jobId', async (req, res, next) => {
 function normalizeRequest(body) {
   const contractPath = normalizeLexDraftingMode(body.contractPath);
   const chatPartial = String(body.chatPartial || '').toLowerCase() === 'true';
+  const previousStoryUpdate = String(body.previousStoryUpdate || '').toLowerCase() === 'true';
   const projectType = String(body.projectType || '').trim() || (chatPartial ? 'new-tool' : '');
   if (!['new-tool', 'extension'].includes(projectType)) {
     throw Object.assign(new Error('Choose whether this is a new tool or an extension of an existing tool.'), { status: 400 });
@@ -394,6 +395,7 @@ function normalizeRequest(body) {
     constraints: clean(body.constraints),
     timeline: clean(body.timeline),
     assumptions: clean(body.assumptions),
+    previousStoryUpdate,
     clarificationAnswers: normalizeClarificationAnswers(body.clarificationAnswers)
   };
 
@@ -416,6 +418,7 @@ function normalizeRequest(body) {
 }
 
 function ensureSupportingFileForDocumentLedPath(request, files) {
+  if (request.previousStoryUpdate) return;
   if (!['refine', 'approved-upload'].includes(request.contractPath)) return;
   if (!files.length) {
     const label = request.contractPath === 'approved-upload' ? 'approved contract file' : 'draft or supporting file';
