@@ -146,6 +146,7 @@ function startChat() {
   chatState = {
     contractPath: 'details',
     projectType: 'new-tool',
+    programId: '',
     engagementId: '',
     customerName: '',
     requesterName: '',
@@ -432,6 +433,9 @@ async function handleChatText(rawValue) {
 
 function captureChatValue(value) {
   switch (chatStep) {
+    case 'program-id':
+      chatState.programId = normalizeOptionalEngagementId(value);
+      break;
     case 'engagement-id':
       chatState.engagementId = normalizeOptionalEngagementId(value);
       break;
@@ -613,6 +617,8 @@ function askNextStepAfterAnswer(step) {
 }
 
 function askNextMissingQuestion() {
+  if (chatState.programId === undefined) chatState.programId = '';
+  if (!chatState.programIdAsked) return askProgramId();
   if (chatState.engagementId === undefined) chatState.engagementId = '';
   if (!chatState.engagementIdAsked) return askEngagementId();
   if (!chatState.customerName || chatState.customerName === 'Not provided yet') return askCustomer();
@@ -626,6 +632,12 @@ function askNextMissingQuestion() {
   if (!chatState.constraints) return askConstraints();
   if (!chatState.timeline) return askTimelineAssumptions();
   finishChatIntake();
+}
+
+function askProgramId() {
+  chatStep = 'program-id';
+  chatState.programIdAsked = true;
+  addBotMessage('Is this work under an existing Program ID? Programs control who can access clustered engagements, stories, contracts, and delivery records. If you are not sure, ask Nova to search first, or say "not sure".');
 }
 
 function askEngagementId() {
@@ -1236,6 +1248,7 @@ function confidenceText(value) {
 function commitChatStateToForm() {
   setRadioValue('contractPath', chatState.contractPath || 'details');
   setRadioValue('projectType', chatState.projectType || 'new-tool');
+  setFormValue('programId', chatState.programId);
   setFormValue('engagementId', chatState.engagementId);
   setFormValue('customerName', chatState.customerName || 'Customer not provided');
   setFormValue('requesterName', chatState.requesterName);

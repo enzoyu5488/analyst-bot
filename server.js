@@ -40,6 +40,7 @@ const MONGODB_URI = process.env.MONGODB_URI || '';
 const MONGODB_DB_NAME = process.env.MONGODB_DB_NAME || 'dbsi-contract-agent';
 const MONGODB_STORIES_COLLECTION = process.env.MONGODB_STORIES_COLLECTION || process.env.MONGODB_COLLECTION || 'customer_user_stories';
 const MONGODB_ENGAGEMENTS_COLLECTION = process.env.MONGODB_ENGAGEMENTS_COLLECTION || 'engagement_registry';
+const MONGODB_ENGAGEMENT_STORY_LINKS_COLLECTION = process.env.MONGODB_ENGAGEMENT_STORY_LINKS_COLLECTION || 'engagement_story_links';
 const ORG_SLUG = normalizeOrgSlug(process.env.ORG_SLUG || 'devboxph');
 const S3_BUCKET = String(process.env.ARI_S3_BUCKET || process.env.S3_BUCKET || '').trim();
 const S3_REGION = String(process.env.ARI_S3_REGION || process.env.S3_REGION || process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || '').trim();
@@ -53,6 +54,7 @@ let mongoClient;
 let s3Client;
 let storiesIndexesReady = false;
 let engagementRegistryIndexesReady = false;
+let engagementStoryLinkIndexesReady = false;
 const analysisJobs = new Map();
 const clarificationJobs = new Map();
 const ANALYSIS_JOB_TTL_MS = Number(process.env.ANALYSIS_JOB_TTL_MS || 30 * 60 * 1000);
@@ -411,6 +413,7 @@ function normalizeRequest(body) {
   const request = {
     contractPath,
     projectType,
+    programId: cleanRegistryId(body.programId),
     engagementId: cleanRegistryId(body.engagementId),
     customerName: clean(body.customerName),
     requesterName: clean(body.requesterName),
@@ -626,6 +629,8 @@ function buildStructuredLexHandoff(handoff) {
     source: 'ari-analyst-bot',
     handoffMode: handoff.draftingMode,
     generatedAt: new Date().toISOString(),
+    programId: handoff.savedStorySet?.programId || handoff.intake.programId || '',
+    programIds: handoff.savedStorySet?.programIds || [handoff.savedStorySet?.programId || handoff.intake.programId].filter(Boolean),
     engagementId: handoff.savedStorySet?.engagementId || '',
     ariStorySetId: handoff.savedStorySet?.id || '',
     customerName: handoff.customerName || handoff.intake.customerName || '',
@@ -684,6 +689,8 @@ function basicLexHandoff(handoff) {
     source: 'ari-analyst-bot',
     handoffMode: handoff.draftingMode,
     generatedAt: new Date().toISOString(),
+    programId: handoff.savedStorySet?.programId || handoff.intake.programId || '',
+    programIds: handoff.savedStorySet?.programIds || [handoff.savedStorySet?.programId || handoff.intake.programId].filter(Boolean),
     engagementId: handoff.savedStorySet?.engagementId || '',
     ariStorySetId: handoff.savedStorySet?.id || '',
     customerName: handoff.customerName || handoff.intake.customerName || '',
@@ -1575,6 +1582,24 @@ async function getEngagementRegistryCollection() {
   return collection;
 }
 
+async function getEngagementStoryLinksCollection() {
+  if (!MONGODB_URI) {
+    throw Object.assign(new Error('MongoDB is not configured. Add MONGODB_URI to .env to save engagement story links.'), { status: 503 });
+  }
+  if (!mongoClient) {
+    mongoClient = new MongoClient(MONGODB_URI);
+    await mongoClient.connect();
+  }
+  const collection = mongoClient.db(MONGODB_DB_NAME).collection(MONGODB_ENGAGEMENT_STORY_LINKS_COLLECTION);
+  if (!engagementStoryLinkIndexesReady) {
+    await collection.createIndex({ orgSlug: 1, engagementId: 1, ariStorySetId: 1 }, { unique: true });
+    await collection.createIndex({ orgSlug: 1, ariStorySetId: 1 });
+    await collection.createIndex({ orgSlug: 1, programId: 1 });
+    engagementStoryLinkIndexesReady = true;
+  }
+  return collection;
+}
+
 function createEngagementId(now = new Date()) {
   const year = now.getFullYear();
   const month = String(now.getMonth() + 1).padStart(2, '0');
@@ -1591,6 +1616,7 @@ async function upsertEngagementRegistryFromStorySet(record) {
   if (!MONGODB_URI || !record?.engagementId) return;
   const collection = await getEngagementRegistryCollection();
   const now = new Date();
+  const programIds = Array.isArray(record.programIds) ? record.programIds.filter(Boolean) : [record.programId].filter(Boolean);
   await collection.updateOne(
     { orgSlug: ORG_SLUG, engagementId: record.engagementId },
     {
@@ -1598,6 +1624,7 @@ async function upsertEngagementRegistryFromStorySet(record) {
         orgSlug: ORG_SLUG,
         engagementId: record.engagementId,
         ariStorySetId: record.id,
+        programId: programIds[0] || '',
         customerName: record.customerName || '',
         customerKey: record.customerKey || normalizeKey(record.customerName),
         projectName: record.projectName || '',
@@ -1618,6 +1645,27 @@ async function upsertEngagementRegistryFromStorySet(record) {
       },
       $setOnInsert: {
         createdAt: record.createdAt || now
+      },
+      ...(programIds.length ? { $addToSet: { programIds: { $each: programIds } } } : {})
+    },
+    { upsert: true }
+  );
+
+  const storyLinks = await getEngagementStoryLinksCollection();
+  await storyLinks.updateOne(
+    { orgSlug: ORG_SLUG, engagementId: record.engagementId, ariStorySetId: record.id },
+    {
+      $set: {
+        orgSlug: ORG_SLUG,
+        engagementId: record.engagementId,
+        ariStorySetId: record.id,
+        programId: programIds[0] || '',
+        updatedAt: now
+      },
+      $setOnInsert: {
+        linkedBy: record.createdByEmail || record.createdByName || 'Ari',
+        linkedAt: now,
+        createdAt: now
       }
     },
     { upsert: true }
@@ -1671,9 +1719,12 @@ async function saveCustomerUserStories(request, analysis, user, documents = []) 
   const createdByName = clean(user?.name || createdByEmail || 'Ari user');
   const id = randomId();
   const engagementId = createEngagementId(now);
+  const programIds = [request.programId].filter(Boolean);
   const record = {
     id,
     engagementId: request.engagementId || engagementId,
+    programId: request.programId || '',
+    programIds,
     orgSlug: ORG_SLUG,
     createdByEmail,
     createdByName,
