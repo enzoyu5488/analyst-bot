@@ -257,11 +257,29 @@ async function handleChatChoice(value, label) {
       askSourceMaterial();
       return;
     }
+    if (value.startsWith('delete-story:')) {
+      const storyId = value.replace('delete-story:', '');
+      const story = (chatState.availableStories || []).find(item => item.id === storyId);
+      askDeleteStoryConfirmation(story);
+      return;
+    }
     const story = (chatState.availableStories || []).find(item => item.id === value);
     if (story) {
       await resumePreviousStory(story);
     }
     return;
+  }
+
+  if (chatStep === 'delete-story-confirm') {
+    if (value === 'confirm-delete-story') {
+      await deleteSelectedStorySet();
+      return;
+    }
+    if (value === 'cancel-delete-story') {
+      addBotMessage('No problem. I kept that story active.');
+      await showMyStorySets();
+      return;
+    }
   }
 
   if (chatStep === 'previous-story-next') {
@@ -669,11 +687,52 @@ async function showMyStorySets() {
         label: `${story.customerName} - ${story.projectName || 'Untitled'} (${formatShortDate(story.createdAt)})`,
         value: story.id
       })),
+      ...stories.slice(0, 6).map(story => ({
+        label: `Delete ${story.customerName} - ${story.projectName || 'Untitled'}`,
+        value: `delete-story:${story.id}`
+      })),
       { label: 'Start new instead', value: 'start-new' }
     ]);
   } catch (error) {
     addBotMessage(`I could not load prior stories right now: ${error.message}`);
     askSourceMaterial();
+  }
+}
+
+function askDeleteStoryConfirmation(story) {
+  if (!story) {
+    addBotMessage('I could not find that saved story in the current list. I will refresh the active stories.');
+    showMyStorySets();
+    return;
+  }
+  chatStep = 'delete-story-confirm';
+  chatState.pendingDeleteStoryId = story.id;
+  addBotMessage(`Delete the active Ari story for ${story.customerName} / ${story.projectName || 'Untitled'}? This will hide it from active lists for you and Lex, but keeps an audit trail in MongoDB.`);
+  renderChatChips([
+    { label: 'Yes, delete it', value: 'confirm-delete-story' },
+    { label: 'Keep it active', value: 'cancel-delete-story' }
+  ]);
+}
+
+async function deleteSelectedStorySet() {
+  const storyId = chatState.pendingDeleteStoryId;
+  if (!storyId) {
+    addBotMessage('I do not have a story selected for deletion anymore. I will refresh the active list.');
+    await showMyStorySets();
+    return;
+  }
+  setChatBusy(true, 'Deleting the saved Ari story...');
+  try {
+    await json(`/api/customer-user-stories/${encodeURIComponent(storyId)}`, { method: 'DELETE' });
+    chatState.pendingDeleteStoryId = '';
+    clearChatStatus();
+    addBotMessage('Deleted. I removed that Ari story from your active lists.');
+    await showMyStorySets();
+  } catch (error) {
+    addBotMessage(`I could not delete that story: ${error.message}`);
+    askDeleteStoryConfirmation((chatState.availableStories || []).find(item => item.id === storyId));
+  } finally {
+    setChatBusy(false);
   }
 }
 

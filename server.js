@@ -231,7 +231,7 @@ app.get('/api/customers/:customerName/user-stories', async (req, res, next) => {
     if (!customerName) throw Object.assign(new Error('Customer name is required.'), { status: 400 });
     const collection = await getStoriesCollection();
     const stories = await collection
-      .find({ orgSlug: ORG_SLUG, customerKey: normalizeKey(customerName) })
+      .find({ orgSlug: ORG_SLUG, customerKey: normalizeKey(customerName), deletedAt: { $exists: false } })
       .sort({ createdAt: -1 })
       .limit(20)
       .toArray();
@@ -252,7 +252,7 @@ app.get('/api/my-user-stories', async (req, res, next) => {
     }
     const collection = await getStoriesCollection();
     const stories = await collection
-      .find({ orgSlug: ORG_SLUG, createdByEmail: email })
+      .find({ orgSlug: ORG_SLUG, createdByEmail: email, deletedAt: { $exists: false } })
       .sort({ createdAt: -1 })
       .limit(12)
       .toArray();
@@ -280,6 +280,13 @@ app.post('/api/customer-user-stories', async (req, res, next) => {
 app.get('/api/customer-user-stories/:storySetId', async (req, res, next) => {
   try {
     const storySet = await getStorySetById(req.params.storySetId);
+    res.json({ success: true, storySet });
+  } catch (error) { next(error); }
+});
+
+app.delete('/api/customer-user-stories/:storySetId', async (req, res, next) => {
+  try {
+    const storySet = await softDeleteStorySet(req.params.storySetId, req.session.user);
     res.json({ success: true, storySet });
   } catch (error) { next(error); }
 });
@@ -1791,9 +1798,63 @@ async function getStorySetById(storySetId) {
   const id = clean(storySetId);
   if (!id) throw Object.assign(new Error('Story set id is required.'), { status: 400 });
   const collection = await getStoriesCollection();
-  const record = await collection.findOne({ orgSlug: ORG_SLUG, id });
+  const record = await collection.findOne({ orgSlug: ORG_SLUG, id, deletedAt: { $exists: false } });
   if (!record) throw Object.assign(new Error('User story summary was not found.'), { status: 404 });
   return clientStorySet(record);
+}
+
+async function softDeleteStorySet(storySetId, user) {
+  const id = clean(storySetId);
+  if (!id) throw Object.assign(new Error('Story set id is required.'), { status: 400 });
+  const collection = await getStoriesCollection();
+  const record = await collection.findOne({ orgSlug: ORG_SLUG, id, deletedAt: { $exists: false } });
+  if (!record) throw Object.assign(new Error('User story summary was not found.'), { status: 404 });
+  const email = String(user?.email || '').trim().toLowerCase();
+  if (record.createdByEmail && email && record.createdByEmail !== email) {
+    throw Object.assign(new Error('You can only delete Ari user stories created under your signed-in email.'), { status: 403 });
+  }
+  if (AUTH_ENABLED && record.createdByEmail && !email) {
+    throw Object.assign(new Error('Sign in to delete Ari user stories created under your email.'), { status: 401 });
+  }
+  const now = new Date();
+  const status = {
+    state: 'deleted',
+    label: 'Deleted',
+    confidence: record.confidence || '',
+    updatedAt: now
+  };
+  await collection.updateOne(
+    { orgSlug: ORG_SLUG, id, deletedAt: { $exists: false } },
+    {
+      $set: {
+        status,
+        deletedAt: now,
+        deletedByEmail: email,
+        deletedByName: clean(user?.name || email || 'Ari user'),
+        updatedAt: now
+      },
+      $push: { statusHistory: status }
+    }
+  );
+  await markEngagementRegistryStoryDeleted(record, status);
+  return clientStorySet({ ...record, status, deletedAt: now, deletedByEmail: email, updatedAt: now });
+}
+
+async function markEngagementRegistryStoryDeleted(record, status) {
+  if (!MONGODB_URI || !record?.engagementId) return;
+  const collection = await getEngagementRegistryCollection();
+  await collection.updateOne(
+    { orgSlug: ORG_SLUG, engagementId: record.engagementId, ariStorySetId: record.id },
+    {
+      $set: {
+        status: status.state,
+        currentOwnerBot: 'Ari',
+        updatedAt: status.updatedAt,
+        deletedAt: status.updatedAt,
+        'timestamps.registryUpdatedAt': status.updatedAt
+      }
+    }
+  );
 }
 
 async function markStorySetSentToLex(storySetId, lexPayload) {
@@ -1925,7 +1986,8 @@ function clientStorySet(record) {
     createdByEmail: record.createdByEmail || '',
     createdByName: record.createdByName || '',
     createdBy: record.source?.createdBy || '',
-    createdAt: record.createdAt
+    createdAt: record.createdAt,
+    deletedAt: record.deletedAt || ''
   };
 }
 
